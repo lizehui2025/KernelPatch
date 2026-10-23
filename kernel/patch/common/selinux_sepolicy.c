@@ -1001,7 +1001,12 @@ void selinux_sepolicy_compute_av_user(u32 ssid, u32 tsid, u16 tclass, struct av_
 
 u32 selinux_sepolicy_clean_seq(void)
 {
-    if (kver >= VERSION(6, 7, 0)) return 4;
+    /* Seqlock counter of the fake status page.  A clean device never touches
+     * this page before init's boot-time policy load, so it is still the
+     * freshly allocated page: sequence 0, policyload 0.  Keep it there -- a
+     * nonzero value is exactly what a "the policy was reloaded" check looks
+     * for (see fill_fake_status_bytes).  The access response carries
+     * KP_AVD_CLEAN_SEQNO instead; that one is the policy's latest_granting. */
     return 0;
 }
 

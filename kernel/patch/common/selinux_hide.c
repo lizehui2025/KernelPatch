@@ -203,8 +203,17 @@ static void put_u32_le(unsigned char *dst, u32 value)
  */
 static void fill_fake_status_bytes(void)
 {
+    /* status.policyload carries the policy's latest_granting, but on a clean
+     * device the page is only allocated when someone first reads it -- after
+     * init's single boot-time policy load -- so it reads 0/0 and stays there
+     * until a reload or setenforce bumps it.  Reporting 0 is therefore the
+     * state a never-touched device shows, and anything else is a reload count:
+     * a checker that sees a nonzero policyload (or sequence) concludes the
+     * policy was reloaded behind its back.  Keep both at zero, on every kernel;
+     * the access answers carry KP_AVD_CLEAN_SEQNO (the clean latest_granting)
+     * as usual. */
     u32 seq = selinux_sepolicy_clean_seq();
-    u32 pload = kver >= VERSION(6, 7, 0) ? 1 : 0;
+    u32 pload = 0;
 
     lib_memset(fake_status_bytes, 0, sizeof(fake_status_bytes));
     put_u32_le(fake_status_bytes + 0, KP_SELINUX_KERNEL_STATUS_VERSION);
@@ -255,22 +264,51 @@ static void init_fake_status(void)
 
 static long g_vma_page_prot_off = -1;
 static long g_vma_vm_flags_off = -1;
+static long g_vma_vm_pgoff_off = -1;
+static long g_vma_vm_file_off = -1;
+
+/* arm64 MTE (KASAN_HW_TAGS) keeps an allocation tag in bits [59:56] of every
+ * pointer it hands out, so the same object can appear as two different values:
+ * the pointer stored in a struct carries the tag of its target allocation, and
+ * the register argument of a callback may or may not carry it.  Comparing such
+ * pointers for identity has to clear that nibble first -- the tag is not part
+ * of the address. */
+#define KP_ADDR_TAG_BITS (0xFUL << 56)
+static unsigned long kp_untag_addr(unsigned long addr)
+{
+    return addr & ~KP_ADDR_TAG_BITS;
+}
+
+static bool kp_vma_off_ok(long off)
+{
+    return off >= 0 && off < 256 && (off & 7) == 0;
+}
 
 static void kp_resolve_vma_offsets(void)
 {
-    long prot = -1, flags = -1;
+    long prot = -1, flags = -1, pgoff = -1, file = -1, size = -1;
 
     if (kp_btf_available()) {
         prot = kp_btf_member_offset("vm_area_struct", "vm_page_prot");
         flags = kp_btf_member_offset("vm_area_struct", "vm_flags");
-    }
-    if (prot > 0 && prot < 256 && (prot & 7) == 0 &&
-        flags > prot && flags < 256 && (flags & 7) == 0) {
-        g_vma_page_prot_off = prot;
-        g_vma_vm_flags_off = flags;
-        log_boot("selinux_hide: vm_area_struct offsets from BTF: vm_page_prot %ld, vm_flags %ld\n",
-                 prot, flags);
-        return;
+        pgoff = kp_btf_member_offset("vm_area_struct", "vm_pgoff");
+        file = kp_btf_member_offset("vm_area_struct", "vm_file");
+        size = kp_btf_type_size("vm_area_struct");
+        if (kp_vma_off_ok(prot) && kp_vma_off_ok(flags) && flags > prot &&
+            kp_vma_off_ok(pgoff) && kp_vma_off_ok(file) && file > pgoff &&
+            size > 0 && pgoff + 8 <= size && file + 8 <= size) {
+            g_vma_page_prot_off = prot;
+            g_vma_vm_flags_off = flags;
+            g_vma_vm_pgoff_off = pgoff;
+            g_vma_vm_file_off = file;
+            log_boot("selinux_hide: vm_area_struct offsets from BTF: "
+                     "vm_page_prot %ld, vm_flags %ld, vm_pgoff %ld, vm_file %ld\n",
+                     prot, flags, pgoff, file);
+            return;
+        }
+        log_boot("selinux_hide: vm_area_struct BTF lookup incomplete "
+                 "(vm_page_prot %ld, vm_flags %ld, vm_pgoff %ld, vm_file %ld)\n",
+                 prot, flags, pgoff, file);
     }
     if (kver >= VERSION(6, 1, 0)) {
         g_vma_page_prot_off = 24;
@@ -279,6 +317,8 @@ static void kp_resolve_vma_offsets(void)
         g_vma_page_prot_off = 72;
         g_vma_vm_flags_off = 80;
     }
+    /* vm_pgoff/vm_file stay unresolved: kp_vma_pgoff() then falls back to the
+     * tagged-pointer-safe scan. */
     log_boot("selinux_hide: vm_area_struct offsets from version table: vm_page_prot %ld, vm_flags %ld\n",
              g_vma_page_prot_off, g_vma_vm_flags_off);
 }
@@ -425,26 +465,26 @@ static ssize_t kp_patch_response_seqno(char *buf, ssize_t ret, u32 new_seqno)
     return ret;
 }
 
+/* Should this app-side /access answer have its seqno rewritten to the clean
+ * latest_granting?
+ *
+ * Yes for every app-side query.  The response's seqno is the policy's
+ * latest_granting, and on this path the stock handler answers from the live
+ * (reloaded N times) policy -- so any caller that is not rewritten reads the
+ * real load count and can compare it with the fake status page.  The old code
+ * only rewrote the exact `u:r:untrusted_app:s0 ... 0` shape, which let every
+ * other carrier (app_zygote -- the only app domain allowed to query SELinux at
+ * all --, isolated_app, sdk_sandbox, the per-app MLS categories, ...) keep the
+ * live seqno.  The uid gate in the caller already limits this to apps.
+ *
+ * The decision bits are untouched: only the seqno token of the response is
+ * replaced. */
 static bool kp_avd_seqno_probe(const char *scon,
                                const char *tcon,
                                u16 tclass)
 {
-    static const char prefix[] = "u:r:untrusted_app:s0";
-    if (tclass != 0)
-        return false;
-    if (!scon || !tcon)
-        return false;
-    if (lib_strncmp(scon, prefix, sizeof(prefix) - 1) != 0)
-        return false;
-    if (lib_strncmp(tcon, prefix, sizeof(prefix) - 1) != 0)
-        return false;
-    if (scon[sizeof(prefix) - 1] != '\0' &&
-        scon[sizeof(prefix) - 1] != ':')
-        return false;
-    if (tcon[sizeof(prefix) - 1] != '\0' &&
-        tcon[sizeof(prefix) - 1] != ':')
-        return false;
-    return true;
+    (void)tclass;
+    return scon && tcon;
 }
 /* ---- app-facing selinuxfs query surface ----
  *
@@ -548,6 +588,31 @@ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
 
 }
 
+/* selinuxfs hands these handlers the transaction buffer (one page) and stock
+ * writes the answer with scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, ...): the
+ * size of the *query* is not an output limit, and the returned length is the
+ * number of bytes actually stored (simple_transaction_set() records it and
+ * read() hands exactly those bytes to userspace).
+ *
+ * Both details matter.  /sys/fs/selinux/access answers are plain text that
+ * libselinux parses as six fields, and a probe may be shorter than the answer:
+ * "u:r:shell:s0 u:r:su:s0 2" is 24 bytes while the answer is 29.  Limiting the
+ * write to the query length cut the answer at 23 bytes, and returning
+ * snprintf()'s untruncated length then made userspace read the cut text plus a
+ * NUL and a few stale heap bytes -- which any parser sees as garbage. */
+#define KP_SEL_RESPONSE_RESERVE 64
+
+static ssize_t kp_sel_reply(char *buf, const char *text)
+{
+    size_t limit = KP_SIMPLE_TRANSACTION_LIMIT - KP_SEL_RESPONSE_RESERVE;
+    size_t n = lib_strlen(text);
+
+    if (n >= limit) n = limit - 1;
+    lib_memcpy(buf, text, n);
+    buf[n] = 0;
+    return (ssize_t)n;
+}
+
 static ssize_t my_write_access_new(struct file *file, char *buf, size_t size)
 {
     uid_t uid = current_uid();
@@ -591,9 +656,13 @@ static ssize_t my_write_access_new(struct file *file, char *buf, size_t size)
     selinux_sepolicy_compute_av_user(ssid, tsid, tclass, &avd);
     avd.seqno = KP_AVD_CLEAN_SEQNO;
 
-    return snprintf(buf, size, "%x %x %x %x %u %x",
-                    avd.allowed, 0xffffffff, avd.auditallow, avd.auditdeny,
-                    avd.seqno, avd.flags);
+    {
+        char out[96];
+        snprintf(out, sizeof(out), "%x %x %x %x %u %x",
+                 avd.allowed, 0xffffffff, avd.auditallow, avd.auditdeny,
+                 avd.seqno, avd.flags);
+        return kp_sel_reply(buf, out);
+    }
 }
 static ssize_t my_write_access(struct file *file, char *buf, size_t size)
 {
@@ -625,8 +694,11 @@ static ssize_t my_write_access(struct file *file, char *buf, size_t size)
             if (ret > 0) {
                 if (sscanf(buf,"%x %x %x %x %u %x",&allowed,&decided,&auditallow,&auditdeny,&seqno,&flags) == 6) {
                     ssize_t origin = ret;
+                    char out[96];
                     seqno = KP_AVD_CLEAN_SEQNO;
-                    ret = snprintf(buf,size,"%x %x %x %x %u %x",allowed,decided,auditallow,auditdeny,seqno,flags);
+                    snprintf(out, sizeof(out), "%x %x %x %x %u %x",
+                             allowed, decided, auditallow, auditdeny, seqno, flags);
+                    ret = kp_sel_reply(buf, out);
                     if (ret > 0 && (size_t)ret < size) {
                         kp_qlog("access_answer(seqno probe)",uid, buf, (size_t)ret);
                         logkfi("access_answer(seqno probe) uid=%u buf=%s,scon=%s,tcon=%s,tclass=%hu,origin=%zd,now=%zd,origin_buf=%s\n",
@@ -808,22 +880,51 @@ static bool kp_is_kernel_text(unsigned long addr)
     return !is_bad_address((void *)addr);
 }
 
-/* Locate vm_pgoff without a per-version offset table.  mmap_region() stores the
- * backing file in vma->vm_file, which sits immediately after vm_pgoff, and this
- * hook is handed that struct file as its first argument -- so scanning the vma
- * for it identifies vm_pgoff on every kernel layout.  vm_ops (NULL here, or a
- * text pointer) precedes the pair and is checked so a coincidental match
- * elsewhere in the struct cannot be mistaken for vm_file. */
+/* Is this word a pointer into the kernel image (text, rodata or data)?  Top
+ * nibble 0xf covers both a tagged and an untagged arm64 kernel address, so the
+ * check survives MTE. */
+static bool kp_is_kernel_ptr(unsigned long addr)
+{
+    return addr == 0 || (addr >> 60) == 0xf;
+}
+
+/* Locate vm_pgoff.  The BTF offsets resolved at init are the authority: they
+ * come from the same table that yields vm_page_prot/vm_flags, so vm_file is
+ * read at its real offset and the identity check against the struct file this
+ * hook was handed needs no guessing at all.
+ *
+ * Without BTF, fall back to scanning the vma for the vm_file argument and
+ * taking the word before it -- and compare pointers with the MTE tag cleared.
+ * The old code compared the raw values, which never matches on an MTE kernel
+ * (KASAN_HW_TAGS): the mmap hook then silently fell back to the stock handler
+ * and apps mapped the real status page. */
 static int kp_vma_pgoff(struct vm_area_struct *vma, void *filp, unsigned long *pgoff)
 {
     unsigned long *w = (unsigned long *)vma;
+    unsigned long want;
     int i;
 
     if (!vma || is_bad_address((void *)vma) || !filp) return -ENOENT;
+    want = kp_untag_addr((unsigned long)filp);
+
+    if (g_vma_vm_pgoff_off >= 0 && g_vma_vm_file_off >= 0) {
+        unsigned long file = *(unsigned long *)((unsigned long)vma + g_vma_vm_file_off);
+        /* This hook lives on the status node's fops, so the mapping is that
+         * file by construction; still require it, so a BTF table that does not
+         * match this kernel degrades into the scan below instead of reading a
+         * field that is not vm_pgoff. */
+        if (kp_untag_addr(file) == want) {
+            *pgoff = *(unsigned long *)((unsigned long)vma + g_vma_vm_pgoff_off);
+            return 0;
+        }
+    }
 
     for (i = 3; i < KP_VMA_SCAN_WORDS; i++) {
-        if (w[i] != (unsigned long)filp) continue;
-        if (w[i - 2] && !kp_is_kernel_text(w[i - 2])) continue;
+        if (kp_untag_addr(w[i]) != want) continue;
+        /* The word before vm_file is vm_ops: NULL for selinuxfs' status node,
+         * otherwise a pointer into the kernel image (.rodata included, which is
+         * why kp_is_kernel_text() alone was too strict). */
+        if (w[i - 2] && !kp_is_kernel_ptr(kp_untag_addr(w[i - 2]))) continue;
         *pgoff = w[i - 1];
         return 0;
     }
