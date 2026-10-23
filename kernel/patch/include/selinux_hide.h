@@ -17,9 +17,11 @@
  * we deep-copy it (see selinux_sepolicy.c) so the context/access/setprocattr
  * hooks answer against that clean snapshot even after APatch/Magisk reloads the
  * policy, and apps (uid >= 10000) see a fake /sys/fs/selinux/status that always
- * reports enforcing with a clean sequence/policyload.  On kernels outside the
- * 4.19..6.3 backup range the write hooks fall back to the live policy and only
- * the status hide remains.
+ * reports enforcing with a clean sequence/policyload.  On < 5.0 the snapshot is
+ * consumed by redirecting the policydb argument of the ss/ helpers for the
+ * duration of a query; >= 5.0 calls those helpers with the snapshot's own
+ * policydb/sidtab directly.  There is no fallback to the live policy: without a
+ * snapshot the feature refuses to enable.
  */
 #include <common.h>
 #define KP_SELINUX_HIDE_MIN_VERSION VERSION(4, 19, 0)
@@ -49,8 +51,8 @@ int selinux_hide_post_fs_data(const char *args);
 /* Supercall control entry. state: 1 = enable, 0 = disable, < 0 = query.
  * Query log (prints every intercepted query with the caller uid and its
  * content -- /sys/fs/selinux/context, /access, /status and setprocattr):
- *   -2 = query the current level (0/1/2), 2 = off, 3 = intercepted queries
- *   (the default), 4 = also the internal ss/ redirect hooks.
+ *   -2 = query the current level (0/1/2), 2 = off, 3 = intercepted queries,
+ *   4 = also the internal ss/ redirect hooks.  The built-in default is off.
  * Returns: feature query -> 1/0 (on/off), log query -> the level;
  * -EOPNOTSUPP when the kernel is too old; set -> 0 or a negative errno. */
 long selinux_hide_control(int state);

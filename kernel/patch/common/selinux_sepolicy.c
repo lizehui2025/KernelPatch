@@ -353,6 +353,12 @@ struct avtab
 #define OCON_IBENDPORT 8
 #define OCON_NUM 9
 
+/* Layout container only.  The kernel reads and writes the object at the offsets
+ * its own build computed, and they differ between kernels (4.19/5.4 use pointer
+ * role_tr/filename_trans/range_tr and flex_array sym_val_to_name; 5.10+ embed the
+ * hashtabs, add compat_filename_trans_count/cond_list_len and keep char** symbol
+ * name tables).  Never dereference a field of this declaration -- anything the
+ * copy needs is read from the serialized blob instead. */
 struct policydb
 {
     int mls_enabled;
@@ -445,6 +451,7 @@ static context_struct_compute_av_fn kp_context_struct_compute_av;
 
 static bool g_backup_ready;
 static void *g_backup_policy; /* our own struct selinux_policy-equivalent (heap) */
+static bool g_backup_allow_unknown; /* POLICYDB_CONFIG_ALLOW_UNKNOWN of the blob */
 
 static bool selinux_sepolicy_supported(void)
 {
@@ -789,7 +796,17 @@ static int kp_dup_sepolicy(void)
         log_boot("selinux_sepolicy: policydb_read failed rc=%d\n", rc);
         goto out_free;
     }
-    pdb->len = len; /* KernelSU restores the serialized length after reparse */
+
+    /* Do NOT touch pdb fields here: the declared struct only matches the
+     * 4.19/5.4 layout, and on 5.10+ its offsets have drifted (embedded
+     * hashtabs, compat_filename_trans_count, cond_list_len).  The copy is never
+     * re-serialized, so the kernel-set fields are all we need.  Read the config
+     * bits from the blob instead (magic, string, version, config: offset 20). */
+    {
+        u32 config = 0;
+        if (len >= 24) lib_memcpy(&config, (const char *)data + 20, sizeof(config));
+        g_backup_allow_unknown = (config & 0x4) != 0; /* ALLOW_UNKNOWN */
+    }
 
     rc = kp_policydb_load_isids(pdb, sidtab);
     if (rc) {
@@ -801,8 +818,8 @@ static int kp_dup_sepolicy(void)
     *(void **)pol = sidtab; /* policy->sidtab @0 */
     g_backup_policy = pol;
     g_backup_ready = true;
-    log_boot("selinux_sepolicy: deep copy ready (vers %u, len %zu, pdb %llx, sidtab %llx)\n",
-             pdb->policyvers, pdb->len, (unsigned long)pdb, (unsigned long)sidtab);
+    log_boot("selinux_sepolicy: deep copy ready (blob len %zu, allow_unknown %d, pdb %llx, sidtab %llx)\n",
+             len, g_backup_allow_unknown, (unsigned long)pdb, (unsigned long)sidtab);
     rc = 0;
     goto out;
 
@@ -875,6 +892,18 @@ static int kp_context_to_sid_with_policy(const char *scontext, u32 scontext_len,
     return rc;
 }
 
+/* sid -> entry.  sidtab_search_core() is a static helper that LTO often
+ * inlines into its callers and drops; sidtab_search_entry() is the public
+ * wrapper around it with force=0, i.e. the same lookup.  Take whichever symbol
+ * the kernel still exports so an `access` query never degrades to "nothing
+ * allowed". */
+static struct sidtab_entry *kp_sidtab_lookup(void *sidtab, u32 sid)
+{
+    if (kp_sidtab_search_entry) return kp_sidtab_search_entry(sidtab, sid);
+    if (kp_sidtab_search_core) return kp_sidtab_search_core(sidtab, sid, 0);
+    return NULL;
+}
+
 static int kp_sid_to_context_with_policy(u32 sid, char **scontext, u32 *scontext_len)
 {
     struct policydb *policydb = kp_backup_policydb();
@@ -884,9 +913,9 @@ static int kp_sid_to_context_with_policy(u32 sid, char **scontext, u32 *scontext
 
     if (scontext) *scontext = NULL;
     *scontext_len = 0;
-    if (!policydb || !sidtab || !kp_sidtab_search_entry) return -EINVAL;
+    if (!policydb || !sidtab) return -EINVAL;
 
-    entry = kp_sidtab_search_entry(sidtab, sid);
+    entry = kp_sidtab_lookup(sidtab, sid);
     if (!entry) return -EINVAL;
 
     if (kp_sidtab_sid2str_get) {
@@ -907,7 +936,8 @@ static void kp_compute_av_user_with_policy(u32 ssid, u32 tsid, u16 tclass, struc
     struct sidtab_entry *se, *te;
     struct context *scontext, *tcontext;
 
-    if (!policydb || !sidtab || !kp_context_struct_compute_av || !kp_sidtab_search_core) return;
+    if (!policydb || !sidtab || !kp_context_struct_compute_av) return;
+    if (!kp_sidtab_search_entry && !kp_sidtab_search_core) return;
 
     avd->allowed = 0;
     avd->auditallow = 0;
@@ -915,21 +945,23 @@ static void kp_compute_av_user_with_policy(u32 ssid, u32 tsid, u16 tclass, struc
     avd->seqno = KP_AVD_CLEAN_SEQNO;
     avd->flags = 0;
 
-    se = kp_sidtab_search_core(sidtab, ssid, 0);
+    se = kp_sidtab_lookup(sidtab, ssid);
     if (!se) return;
     scontext = &se->context;
 
-    te = kp_sidtab_search_core(sidtab, tsid, 0);
+    te = kp_sidtab_lookup(sidtab, tsid);
     if (!te) return;
     tcontext = &te->context;
 
     if (unlikely(!tclass)) {
         /* KernelSU security_compute_av_user_with_policy parity: stock answers
          * an unknown class with everything granted when the (clean) policy
-         * allows unknown classes.  The permissive-domain flag is deliberately
-         * not replicated: reading permissive_map needs an ebitmap walk over
-         * layout-sensitive nodes for no hiding benefit. */
-        if (policydb->allow_unknown) avd->allowed = 0xffffffff;
+         * allows unknown classes.  The flag comes from the serialized blob's
+         * config word -- reading policydb->allow_unknown directly would use a
+         * struct layout that has drifted since 4.19.  The permissive-domain
+         * flag is deliberately not replicated: reading permissive_map needs an
+         * ebitmap walk over layout-sensitive nodes for no hiding benefit. */
+        if (g_backup_allow_unknown) avd->allowed = 0xffffffff;
         return;
     }
 
@@ -971,6 +1003,14 @@ u32 selinux_sepolicy_clean_seq(void)
 {
     if (kver >= VERSION(6, 7, 0)) return 4;
     return 0;
+}
+
+int selinux_sepolicy_clean_deny_unknown(void)
+{
+    /* Without a snapshot nothing is answered from the clean policy; report the
+     * value the kernel uses before any policy is loaded. */
+    if (!g_backup_ready) return 1;
+    return g_backup_allow_unknown ? 0 : 1;
 }
 
 /* ---- init ---- */

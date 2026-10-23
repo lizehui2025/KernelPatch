@@ -43,18 +43,33 @@ int selinux_sepolicy_snapshot(void);
 
 bool selinux_sepolicy_backup_ready(void);
 
+/* Redirect scope used by the < 5.0 path: while a task is inside it, the
+ * string_to_context_struct / context_struct_compute_av hooks swap the live
+ * policydb for the clean snapshot.  Enter returns 0 on success, -EAGAIN when
+ * another task already holds the slot. */
+int selinux_sepolicy_clean_eval_enter(void);
+void selinux_sepolicy_clean_eval_leave(void);
+
 /* Query helpers that answer against the deep copy. */
 int selinux_sepolicy_context_to_sid(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp);
 int selinux_sepolicy_sid_to_context(u32 sid, char **scontext, u32 *scontext_len);
 int selinux_sepolicy_context_str_to_sid(const char *scontext, u32 *out_sid, gfp_t gfp);
 void selinux_sepolicy_compute_av_user(u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);
 
-/* Sequence value the fake /sys/fs/selinux/status page uses (>= 6.7), and the
- * access-query response's seqno.  A clean device exposes sequence=4/policyload=1
- * in the status page but latest_granting=1 in the access response -- the two are
- * different counters, so they must NOT be equal (detectors compare both). */
+/* Seqlock counter the fake /sys/fs/selinux/status page reports.  It is not the
+ * same value as the access response's seqno: status.sequence is the seqlock
+ * counter (even when idle, +2 per update) while status.policyload and the
+ * access response carry the policy's latest_granting.  Conflating the two is
+ * itself a detectable inconsistency. */
 u32 selinux_sepolicy_clean_seq(void);
+/* latest_granting a clean device reports after its single boot policy load;
+ * used as the access response's seqno. */
 #define KP_AVD_CLEAN_SEQNO 1
+
+/* deny_unknown of the clean policy (!allow_unknown).  The status page has to
+ * agree with what this feature answers for an unknown class, otherwise the two
+ * views contradict each other on an allow_unknown policy. */
+int selinux_sepolicy_clean_deny_unknown(void);
 
 /* The queries above compute entirely against the deep copy (KernelSU style);
  * no redirect scope is needed or provided any more. */
