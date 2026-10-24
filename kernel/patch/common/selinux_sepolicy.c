@@ -710,28 +710,38 @@ static bool kp_sepolicy_read_logged;
 
 static int kp_sepolicy_read(void **data, size_t *len)
 {
+    bool without_state = selinux_hide_is_without_sepolicy_state_version();
+
     if (!kfunc(security_read_policy)) {
         kfunc(security_read_policy) = (typeof(kfunc(security_read_policy)))lookup_name_with_suffix(
             "security_read_policy");
         if (!kfunc(security_read_policy)) return -ENOENT;
     }
-    if (!selinux_hide_is_without_sepolicy_state_version()) return kfunc(security_read_policy)(data, len);
+
+    /* Say which ABI is used, once, before the first call: if a future kernel
+     * ever disagrees with this split this line is the evidence. */
+    if (!kp_sepolicy_read_logged) {
+        kp_sepolicy_read_logged = true;
+        log_boot("selinux_sepolicy: security_read_policy: %s ABI (kver %x)\n",
+                 without_state ? "plain 2-arg" : "state 3-arg", kver);
+    }
+
+    /* 6.6 and later (the "policy API without a state argument") use the plain
+     * two-argument form; 5.10..6.5 still pass struct selinux_state and must go
+     * through the compat cast below.  Getting this backwards calls the
+     * two-argument function with three arguments: the kernel then reads
+     * `*selinux_state' as the output buffer pointer and writes the whole
+     * serialized policy into it, which corrupts selinux_state and hangs the
+     * boot long before userspace is up. */
+    if (without_state) return kfunc(security_read_policy)(data, len);
 
     if (!kp_sepolicy_state_addr) kp_sepolicy_state_addr = lookup_name_with_suffix("selinux_state");
     if (!kp_sepolicy_state_addr) {
-        if (!kp_sepolicy_read_logged) {
-            kp_sepolicy_read_logged = true;
-            log_boot("selinux_sepolicy: selinux_state not found, the policy cannot be serialized\n");
-        }
+        logkfw("selinux_sepolicy: selinux_state not found, the policy cannot be serialized\n");
         return -ENOENT;
     }
     if (!kp_security_read_policy_compat)
         kp_security_read_policy_compat = (security_read_policy_compat_fn)(uintptr_t)kfunc(security_read_policy);
-    if (!kp_sepolicy_read_logged) {
-        kp_sepolicy_read_logged = true;
-        log_boot("selinux_sepolicy: security_read_policy uses the state ABI, selinux_state @ %llx\n",
-                 kp_sepolicy_state_addr);
-    }
     return kp_security_read_policy_compat((void *)kp_sepolicy_state_addr, data, len);
 }
 
@@ -755,6 +765,20 @@ static bool g_clean_locked;     /* a marker-carrying load was seen */
 
 static void kp_log_blob_diag(const char *tag, const void *blob, size_t len);
 
+/* A serialized policy starts with POLICYDB_MAGIC (policydb_write()).  Cheap
+ * sanity gate so a serializer call that went wrong is reported instead of being
+ * handed to policydb_read(), which would happily walk a garbage buffer. */
+#define KP_POLICYDB_MAGIC 0xf97cff8cU
+
+static bool kp_blob_looks_valid(const void *blob, size_t len)
+{
+    u32 magic = 0;
+
+    if (!blob || len < 4096 || len > (16u << 20)) return false;
+    lib_memcpy(&magic, blob, sizeof(magic));
+    return magic == KP_POLICYDB_MAGIC;
+}
+
 static void kp_capture_policy_load(uint64_t ret)
 {
     void *data = NULL;
@@ -773,6 +797,11 @@ static void kp_capture_policy_load(uint64_t ret)
     if (rc == -ENOENT) return;
     if (rc || !data || !len) {
         if (data && kfunc(kvfree)) kfunc(kvfree)(data);
+        return;
+    }
+    if (!kp_blob_looks_valid(data, len)) {
+        logkfw("selinux_sepolicy: serialized policy rejected (len %zu), ignoring this load\n", len);
+        if (kfunc(kvfree)) kfunc(kvfree)(data);
         return;
     }
 
@@ -936,6 +965,11 @@ static int kp_dup_sepolicy(void)
             log_boot("selinux_sepolicy: security_read_policy failed rc=%d\n", rc);
             if (data && kfunc(kvfree)) kfunc(kvfree)(data);
             return rc ? rc : -EINVAL;
+        }
+        if (!kp_blob_looks_valid(data, len)) {
+            logkfw("selinux_sepolicy: serialized policy rejected (len %zu), no snapshot\n", len);
+            if (kfunc(kvfree)) kfunc(kvfree)(data);
+            return -EINVAL;
         }
         owned = true;
         /* No load was captured: this is whatever policy is live now, so report
