@@ -56,6 +56,9 @@
 #define KP_BACKUP_POLICY_SIZE 0x8000 /* standalone policydb + wrapper */
 #define KP_BACKUP_SIDTAB_SIZE 0x4000 /* struct sidtab (hash roots etc.) */
 #define KP_GFP_KERNEL 0xcc0u /* __GFP_RECLAIM | __GFP_IO | __GFP_FS */
+/* selinuxfs' SIMPLE_TRANSACTION_LIMIT: no write larger than one page reaches a
+ * handler, so a context payload is always shorter than this. */
+#define KP_CONTEXT_PAYLOAD_LIMIT 4096
 
 /* ---- SELinux ss/ structures (layouts from the kpm selinux_hook module) ---- */
 
@@ -624,6 +627,55 @@ static bool kp_blob_is_clean(const void *blob, size_t len)
     return true;
 }
 
+/* ---- security_read_policy() ABI ----
+ *
+ * AOSP GKI 5.10/5.15/6.1 keep the state-based form
+ *   int security_read_policy(struct selinux_state *state, void **data, size_t *len);
+ * and 6.6 dropped the state argument.  ksyms/misc.c declares only the modern
+ * prototype, so the compat form is called through a cast on the SAME pointer
+ * instead of adding a second kfunc entry: a *_compat name would have to be
+ * matched explicitly in the misc ksym pass, which this symbol does not have.
+ * selinux_state is the extern global of security/selinux/hooks.c and stays in
+ * kallsyms (KALLSYMS_ALL) on every version that passes it in.
+ *
+ * Without this branch a < 6.6 kernel calls the 3-argument function with two
+ * arguments, i.e. reads `data'/`len' out of stale registers -- the serialization
+ * then either faults or returns garbage, and the snapshot silently never
+ * happens.
+ */
+typedef int (*security_read_policy_compat_fn)(void *state, void **data, size_t *len);
+
+static security_read_policy_compat_fn kp_security_read_policy_compat;
+static unsigned long kp_sepolicy_state_addr;
+static bool kp_sepolicy_read_logged;
+
+static int kp_sepolicy_read(void **data, size_t *len)
+{
+    if (!kfunc(security_read_policy)) {
+        kfunc(security_read_policy) = (typeof(kfunc(security_read_policy)))lookup_name_with_suffix(
+            "security_read_policy");
+        if (!kfunc(security_read_policy)) return -ENOENT;
+    }
+    if (!selinux_hide_is_without_sepolicy_state_version()) return kfunc(security_read_policy)(data, len);
+
+    if (!kp_sepolicy_state_addr) kp_sepolicy_state_addr = lookup_name_with_suffix("selinux_state");
+    if (!kp_sepolicy_state_addr) {
+        if (!kp_sepolicy_read_logged) {
+            kp_sepolicy_read_logged = true;
+            log_boot("selinux_sepolicy: selinux_state not found, the policy cannot be serialized\n");
+        }
+        return -ENOENT;
+    }
+    if (!kp_security_read_policy_compat)
+        kp_security_read_policy_compat = (security_read_policy_compat_fn)(uintptr_t)kfunc(security_read_policy);
+    if (!kp_sepolicy_read_logged) {
+        kp_sepolicy_read_logged = true;
+        log_boot("selinux_sepolicy: security_read_policy uses the state ABI, selinux_state @ %llx\n",
+                 kp_sepolicy_state_addr);
+    }
+    return kp_security_read_policy_compat((void *)kp_sepolicy_state_addr, data, len);
+}
+
 /* ---- policy-load capture ----
  *
  * Android loads the policy more than once: first-stage init loads the platform
@@ -642,6 +694,8 @@ static void *g_clean_blob;      /* last marker-free policy blob (as loaded) */
 static size_t g_clean_blob_len;
 static bool g_clean_locked;     /* a marker-carrying load was seen */
 
+static void kp_log_blob_diag(const char *tag, const void *blob, size_t len);
+
 static void kp_capture_policy_load(uint64_t ret)
 {
     void *data = NULL;
@@ -656,12 +710,8 @@ static void kp_capture_policy_load(uint64_t ret)
      * not the blob pointer, and dereferencing it oopsed).  Serialize whatever
      * is active now instead -- right after a successful load that is exactly
      * the policy that was just installed. */
-    if (!kfunc(security_read_policy)) {
-        kfunc(security_read_policy) = (typeof(kfunc(security_read_policy)))lookup_name_with_suffix(
-            "security_read_policy");
-        if (!kfunc(security_read_policy)) return;
-    }
-    rc = security_read_policy(&data, &len);
+    rc = kp_sepolicy_read(&data, &len);
+    if (rc == -ENOENT) return;
     if (rc || !data || !len) {
         if (data && kfunc(kvfree)) kfunc(kvfree)(data);
         return;
@@ -671,6 +721,7 @@ static void kp_capture_policy_load(uint64_t ret)
         g_clean_locked = true;
         log_boot("selinux_sepolicy: loaded policy len %zu carries root markers, keeping the %zu byte clean blob\n",
                  len, g_clean_blob_len);
+        kp_log_blob_diag("rejected", data, len);
     } else {
         copy = kp_vmalloc(len);
         if (copy) {
@@ -740,6 +791,64 @@ static void kp_log_blob_diag(const char *tag, const void *blob, size_t len)
              kp_blob_count(blob, len, "xposed"), kp_blob_count(blob, len, "droidspaces"));
 }
 
+/* ---- snapshot dirtiness self-check ----
+ *
+ * The name scan above only sees *strings*, so a manager that extends an
+ * existing name leaves the string table untouched and gets a "clean" verdict.
+ * APatch is exactly that case: it turns the stock object type `su' into a
+ * domain by adding (roletype r su) / domain attributes, and the marker list
+ * stays silent.
+ *
+ * Adding "su" to the marker list would be wrong in both directions.  AOSP's own
+ * plat_sepolicy.cil ships "(type su)" and "(roletype object_r su)", so the
+ * string is present on every device (checked on this ROM: one hit), while the
+ * thing a detector asks about -- the domain context u:r:su:s0 -- only becomes
+ * valid after a manager patched the policy.
+ *
+ * So ask the snapshot itself: resolve the manager domains that a stock policy
+ * does not define.  A hit means the captured blob was already patched, the
+ * feature would answer those queries with the manager's own policy and hide
+ * nothing, and saying so is more useful than pretending it works.
+ *
+ * Explicit calls on purpose: an array of string pointers inside kpimg is not
+ * relocated at load time, so its entries would still hold link addresses (see
+ * kp_blob_is_clean).
+ */
+static bool g_snapshot_dirty;
+
+static void kp_probe_one(const char *ctx, int *hits)
+{
+    u32 sid = 0;
+    int rc = kp_context_to_sid_with_policy(ctx, lib_strlen(ctx), &sid, SECSID_NULL, KP_GFP_KERNEL);
+
+    if (!rc) {
+        (*hits)++;
+        logkfw("selinux_sepolicy: snapshot resolves %s -> sid %u; it already carries a manager "
+               "domain, hiding it is ineffective\n",
+               ctx, sid);
+    }
+}
+
+static void kp_probe_snapshot_domains(void)
+{
+    int hits = 0;
+
+    if (!g_backup_ready) return;
+    kp_probe_one("u:r:su:s0", &hits);
+    kp_probe_one("u:r:ksu:s0", &hits);
+    kp_probe_one("u:r:magisk:s0", &hits);
+    kp_probe_one("u:r:lsposed:s0", &hits);
+    if (hits)
+        g_snapshot_dirty = true;
+    else
+        log_boot("selinux_sepolicy: snapshot answers no manager domain (clean)\n");
+}
+
+bool selinux_sepolicy_snapshot_dirty(void)
+{
+    return g_snapshot_dirty;
+}
+
 static int kp_dup_sepolicy(void)
 {
     struct policy_file fp;
@@ -763,7 +872,7 @@ static int kp_dup_sepolicy(void)
         len = g_clean_blob_len;
         log_boot("selinux_sepolicy: using the captured clean policy blob (%zu bytes)\n", len);
     } else {
-        rc = security_read_policy(&data, &len);
+        rc = kp_sepolicy_read(&data, &len);
         if (rc || !data || !len) {
             log_boot("selinux_sepolicy: security_read_policy failed rc=%d\n", rc);
             if (data && kfunc(kvfree)) kfunc(kvfree)(data);
@@ -820,6 +929,7 @@ static int kp_dup_sepolicy(void)
     g_backup_ready = true;
     log_boot("selinux_sepolicy: deep copy ready (blob len %zu, allow_unknown %d, pdb %llx, sidtab %llx)\n",
              len, g_backup_allow_unknown, (unsigned long)pdb, (unsigned long)sidtab);
+    kp_probe_snapshot_domains();
     rc = 0;
     goto out;
 
@@ -870,25 +980,28 @@ static int kp_context_to_sid_with_policy(const char *scontext, u32 scontext_len,
     if (!policydb || !sidtab || !scontext_len) return -EINVAL;
     if (!kp_string_to_context_struct || !kp_sidtab_context_to_sid) return -ENOSYS;
 
-    /* Hot path: every app selinuxfs query goes through here.  Use a stack
-     * buffer for the (short) context string; vmalloc/vfree per query was a
-     * measurable cost and a page-table churn source. */
-    char stackbuf[256];
-    char *heapbuf = NULL, *scontext2;
-    if (scontext_len < sizeof(stackbuf)) {
-        scontext2 = stackbuf;
-    } else {
-        heapbuf = kp_vmalloc(scontext_len + 1);
-        if (!heapbuf) return -ENOMEM;
-        scontext2 = heapbuf;
-    }
+    /* Hot path: every app selinuxfs query goes through here.
+     *
+     * No stack/kmalloc threshold and no vmalloc.  Any in-code size boundary is
+     * visible from userspace: with `char stackbuf[256]' plus a vmalloc fallback
+     * the handler shows a ~2.5 us step at exactly 256 bytes (a length sweep of
+     * invalid contexts measures it without any knowledge of the policy), while
+     * the stock handler's memdup_user_nul() has no such step.  That is a pure
+     * implementation fingerprint, so mirror stock: one kmalloc of len + 1.  The
+     * payload is capped by selinuxfs' own SIMPLE_TRANSACTION_LIMIT anyway. */
+    char *scontext2;
+
+    if (scontext_len >= KP_CONTEXT_PAYLOAD_LIMIT) return -EINVAL;
+    if (!kfunc(kmalloc)) return -ENOSYS;
+    scontext2 = kfunc(kmalloc)(scontext_len + 1, gfp);
+    if (!scontext2) return -ENOMEM;
     lib_memcpy(scontext2, scontext, scontext_len);
     scontext2[scontext_len] = '\0';
 
     rc = kp_string_to_context_struct(policydb, sidtab, scontext2, &context, def_sid);
     if (!rc)
         rc = kp_sidtab_context_to_sid(sidtab, &context, out_sid);
-    if (heapbuf) kp_vfree(heapbuf);
+    if (kfunc(kfree)) kfunc(kfree)(scontext2);
     return rc;
 }
 

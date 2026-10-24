@@ -43,6 +43,11 @@ int selinux_sepolicy_snapshot(void);
 
 bool selinux_sepolicy_backup_ready(void);
 
+/* True when the snapshot already resolves a manager domain (u:r:su:s0,
+ * u:r:ksu:s0, ...): the captured blob was patched before it was taken, so the
+ * feature cannot hide those names and the manager gets a warning instead. */
+bool selinux_sepolicy_snapshot_dirty(void);
+
 /* Redirect scope used by the < 5.0 path: while a task is inside it, the
  * string_to_context_struct / context_struct_compute_av hooks swap the live
  * policydb for the clean snapshot.  Enter returns 0 on success, -EAGAIN when

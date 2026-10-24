@@ -52,6 +52,11 @@ extern int android_is_safe_mode;
 #endif
 
 #define KP_SELINUX_HIDE_FILE "/data/adb/ap/selinux_hide"
+/* Optional opt-in: when this file exists and the snapshot turned out to carry a
+ * manager domain already (see selinux_sepolicy_snapshot_dirty), the feature
+ * refuses to enable instead of answering with a policy that hides nothing.
+ * Default (file absent) is to stay enabled and warn. */
+#define KP_SELINUX_HIDE_STRICT_FILE "/data/adb/ap/selinux_hide_strict"
 
 
 #define KP_O_RDONLY 0
@@ -181,6 +186,36 @@ int selinux_hide_query_log_level(void)
     return selinux_hide_query_log;
 }
 
+/* selinux_state global of security/selinux/hooks.c, resolved in
+ * selinux_hide_init() before anything below runs.  The < 6.6 avc ABI needs it
+ * as the state argument, and fill_fake_status_bytes() reads the live enforcing
+ * flag out of it. */
+static unsigned long kp_selinux_state_addr;
+
+/*
+ * Live enforcing flag for the fake status page.
+ *
+ * Hardcoding 1 is wrong in a detectable way: /sys/fs/selinux/enforce
+ * (sel_read_enforce) is NOT hooked, so on a device that was switched to
+ * permissive the fake page would advertise "enforcing" while the readable
+ * switch next to it says "permissive" -- a one-line cross-check that no clean
+ * device can fail.  Report the real value instead.
+ *
+ * BTF supplies the member offset (enforcing is the first byte of
+ * struct selinux_state on GKI 5.10..6.6); when the offset or the symbol is
+ * missing, fall back to 1 -- the boot default -- rather than guessing.
+ */
+static u32 kp_live_enforcing(void)
+{
+    static long off = -2; /* -2 = not yet queried, -1 = no BTF member */
+    unsigned long addr = kp_selinux_state_addr;
+
+    if (off == -2) off = kp_btf_member_offset("selinux_state", "enforcing");
+    if (!addr) addr = lookup_name_with_suffix("selinux_state");
+    if (!addr || off < 0) return 1;
+    return *(volatile u8 *)(addr + (unsigned long)off) ? 1 : 0;
+}
+
 static void put_u32_le(unsigned char *dst, u32 value)
 {
     dst[0] = (unsigned char)(value & 0xff);
@@ -198,8 +233,8 @@ static void put_u32_le(unsigned char *dst, u32 value)
  * deny_unknown=!allow_unknown; only later policy loads and setenforce calls
  * bump sequence (by two) and policyload.  Reporting that initial state is a
  * legitimate snapshot of a device whose status page was first read after boot,
- * and it is exactly the state that hides the reload count and a permissive
- * mode.  sequence must stay even: readers spin while it is odd.
+ * and it is exactly the state that hides the reload count.  sequence must stay
+ * even: readers spin while it is odd.
  */
 static void fill_fake_status_bytes(void)
 {
@@ -218,7 +253,7 @@ static void fill_fake_status_bytes(void)
     lib_memset(fake_status_bytes, 0, sizeof(fake_status_bytes));
     put_u32_le(fake_status_bytes + 0, KP_SELINUX_KERNEL_STATUS_VERSION);
     put_u32_le(fake_status_bytes + 4, seq);
-    put_u32_le(fake_status_bytes + 8, 1);  /* enforcing -- always report enforcing */
+    put_u32_le(fake_status_bytes + 8, kp_live_enforcing()); /* enforcing: live, see kp_live_enforcing */
     put_u32_le(fake_status_bytes + 12, pload);
     /* Must match what the access hook answers for an unknown class. */
     put_u32_le(fake_status_bytes + 16, (u32)selinux_sepolicy_clean_deny_unknown());
@@ -348,7 +383,6 @@ static bool kp_pgprot_plausible(unsigned long prot)
 /* ---- permission / sid helpers (KernelSU my_write_* parity) ---- */
 
 static avc_has_perm_compat_fn kp_avc_has_perm_compat;
-static unsigned long kp_selinux_state_addr; /* < 6.6 avc ABI needs the state */
 
 static u32 kp_current_sid(void)
 {
@@ -827,6 +861,12 @@ static ssize_t my_sel_read_handle_status(struct file *filp, char __user *buffer,
         loff_t pos = ppos ? *ppos : 0;
         size_t avail;
 
+        /* Fail closed: without the fake page the stock path would return the
+         * live sequence/policyload, which is the very value this hides. */
+        if (!fake_status_vaddr) {
+            logkfw("selinux_hide: status read: fake page missing, refusing the read\n");
+            return -ENODEV;
+        }
         if (pos < 0) return -EINVAL;
         if (!count || pos >= (loff_t)sizeof(fake_status_bytes)) return 0;
 
@@ -941,17 +981,31 @@ static int my_sel_mmap_handle_status(struct file *filp, struct vm_area_struct *v
 
     kp_qlog_plain("status_mmap", uid);
 
-    if (!selinux_hide_enabled || uid < 10000 || !fake_status_vaddr || !kp_remap_pfn_range)
+    /* Only a non-app caller, or a disabled feature, gets the stock handler:
+     * that is the behaviour such a caller would see anyway. */
+    if (!selinux_hide_enabled || uid < 10000)
         goto real_page;
 
-    if (!vma || is_bad_address((void *)vma)) goto real_page;
+    /* Everything below is the app-facing path while the feature is on.  It
+     * must never fall through to the stock mapping: the stock handler would
+     * hand out the REAL status page, which is exactly the leak this hook
+     * exists to prevent.  A fall-through used to be "safe" in the sense that
+     * it kept apps working, but it silently published the live sequence and
+     * policyload (the mmap path is what libselinux uses), so a broken BTF or
+     * an unexpected vma layout turned the whole feature off without a trace
+     * except one log line.  Fail closed instead and say so. */
+    if (!fake_status_vaddr || !kp_remap_pfn_range || !vma || is_bad_address((void *)vma)) {
+        logkfw("selinux_hide: status mmap: feature incomplete (page %px remap %llx vma %px), refusing the mapping\n",
+               fake_status_vaddr, (unsigned long)kp_remap_pfn_range, vma);
+        return -ENODEV;
+    }
 
     start = vm[KP_VMA_VM_START_OFF / sizeof(unsigned long)];
     size = vm[KP_VMA_VM_END_OFF / sizeof(unsigned long)] - start;
 
     if (kp_vma_pgoff(vma, filp, &pgoff)) {
-        logkfw("selinux_hide: status mmap: cannot locate vm_pgoff, using the stock handler\n");
-        goto real_page;
+        logkfw("selinux_hide: status mmap: cannot locate vm_pgoff, refusing the mapping\n");
+        return -ENODEV;
     }
 
     /* Same contract, same errno as stock sel_mmap_handle_status. */
@@ -965,28 +1019,28 @@ static int my_sel_mmap_handle_status(struct file *filp, struct vm_area_struct *v
     /* A status mapping is always readable, so a slot without VM_READ|VM_MAYREAD
      * is not vm_flags: never write to a slot that was not identified. */
     if ((vm[flags_off] & (KP_VM_READ | KP_VM_MAYREAD)) != (KP_VM_READ | KP_VM_MAYREAD)) {
-        logkfw("selinux_hide: status mmap: vm_flags slot looks wrong (0x%lx at +%lu), using the stock handler\n",
+        logkfw("selinux_hide: status mmap: vm_flags slot looks wrong (0x%lx at +%lu), refusing the mapping\n",
                vm[flags_off], flags_off * sizeof(unsigned long));
-        goto real_page;
+        return -ENODEV;
     }
     if (vm[flags_off] & KP_VM_WRITE) return -EPERM;
     vm[flags_off] &= ~KP_VM_MAYWRITE;
 
     prot = vm[kp_vma_page_prot_off() / sizeof(unsigned long)];
     if (!kp_pgprot_plausible(prot)) {
-        logkfw("selinux_hide: status mmap: bogus prot=%016lx at vma %px\n", prot, vma);
-        goto real_page;
+        logkfw("selinux_hide: status mmap: bogus prot=%016lx at vma %px, refusing the mapping\n", prot, vma);
+        return -ENODEV;
     }
 
     if (start & (kpage - 1)) {
         logkfw("selinux_hide: status mmap: unaligned vm_start=%lx\n", start);
-        goto real_page;
+        return -EINVAL;
     }
 
     pa = pgtable_phys_kernel((uintptr_t)fake_status_vaddr);
     if (!pa) {
         logkfw("selinux_hide: status mmap: cannot resolve the fake page PA (vma %px)\n", vma);
-        goto real_page;
+        return -ENODEV;
     }
 
     ret = kp_remap_pfn_range(vma, start, pa >> page_shift, size, prot);
@@ -994,6 +1048,7 @@ static int my_sel_mmap_handle_status(struct file *filp, struct vm_area_struct *v
 
     logkfw("selinux_hide: status mmap: remap_pfn_range failed ret=%d pa=%llx start=%lx\n",
            ret, pa, start);
+    return ret;
 
 real_page:
     return orig_sel_mmap_handle_status(filp, vma);
@@ -1384,6 +1439,24 @@ int selinux_hide_post_fs_data(const char *args)
              * policy even after apd/Magisk reloads it. */
             int src = selinux_sepolicy_snapshot();
             log_boot("selinux_sepolicy: snapshot rc=%d\n", src);
+
+            /* The snapshot only hides anything if it predates the manager's
+             * patch.  When it does not, the hooks would answer with the very
+             * policy they are supposed to keep quiet (and still add their cost
+             * and their inconsistencies), so an explicit strict marker turns
+             * the feature off instead.  No marker: keep it on, the warning is
+             * in the boot log. */
+            if (selinux_sepolicy_snapshot_dirty()) {
+                struct file *sf = filp_open(KP_SELINUX_HIDE_STRICT_FILE, KP_O_RDONLY, 0);
+                bool strict = !IS_ERR(sf);
+                if (strict) {
+                    filp_close(sf, 0);
+                    logkfw("selinux_hide: %s is present and the snapshot already carries a manager "
+                           "domain, refusing to enable\n",
+                           KP_SELINUX_HIDE_STRICT_FILE);
+                    return 0;
+                }
+            }
 
             selinux_hide_approved = true;
         }
