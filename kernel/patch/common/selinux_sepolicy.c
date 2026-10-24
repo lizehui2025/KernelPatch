@@ -42,6 +42,7 @@
 #include <linux/string.h>
 #include <linux/err.h>
 #include <asm/current.h>
+#include <asm/cmpxchg.h>
 #include <uapi/asm-generic/errno.h>
 #include <security/selinux/include/security.h>
 #include <security/selinux/include/avc.h>
@@ -451,7 +452,9 @@ static void kp_payload_resolve(void)
 static void *kp_payload_alloc(size_t size, gfp_t gfp, bool *via_vmalloc)
 {
     kp_payload_resolve();
-    if (kp_payload_kmalloc) {
+    /* Only use the slab when the matching free is resolved too: allocating
+     * through kmalloc and then having no kfree leaks every query. */
+    if (kp_payload_kmalloc && kp_payload_kfree) {
         *via_vmalloc = false;
         return kp_payload_kmalloc(size, gfp);
     }
@@ -469,12 +472,22 @@ static void kp_payload_free(void *p, bool via_vmalloc)
 /* Free a string the kernel allocated for us (context_struct_to_string() or the
  * sidtab sid2str copy).  kfunc(kfree) is NULL for the same reason as
  * kfunc(kmalloc) -- kfree has no misc ksym match -- so the old call site leaked
- * one canonical string per accepted query. */
+ * one canonical string per accepted query.  If kfree still cannot be resolved
+ * the string cannot be handed back; say so once instead of leaking silently. */
 void kp_kernel_str_free(void *p)
 {
+    static bool warned;
+
     if (!p) return;
     kp_payload_resolve();
-    if (kp_payload_kfree) kp_payload_kfree(p);
+    if (kp_payload_kfree) {
+        kp_payload_kfree(p);
+        return;
+    }
+    if (!warned) {
+        warned = true;
+        logkfw("selinux_sepolicy: kfree unresolved, kernel strings cannot be released\n");
+    }
 }
 
 /* ---- resolved symbols ---- */
@@ -529,42 +542,72 @@ static int kp_sid_to_context_with_policy(u32 sid, char **scontext, u32 *scontext
 static void kp_compute_av_user_with_policy(u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);
 
 
+/* Redirect scope: one slot per in-flight app query.  Claiming a slot must be
+ * atomic -- a plain "if (empty) set" let two tasks both believe they had
+ * entered, and the loser then ran the stock handler with no redirect at all,
+ * i.e. it answered from the live (patched) policy: the exact leak this scope
+ * exists to prevent, with no error to the caller.  Several slots also keep
+ * ordinary concurrency (zygote forks, app startup) from being refused; only
+ * more than KP_CLEAN_EVAL_SLOTS simultaneous queries fall back to -EAGAIN.
+ *
+ * Only the owning task touches its own depth, and a task runs on one CPU at a
+ * time, so depth needs no atomic access; the task pointer is claimed with the
+ * kernel's inline cmpxchg so no out-of-line atomic helper (and no locking
+ * header) is needed -- __atomic_compare_exchange_n() lowers to
+ * __aarch64_cas8_acq_rel on toolchains that enable outline atomics.
+ */
+#define KP_CLEAN_EVAL_SLOTS 8
+
 static struct {
     void *task;
     u32 depth;
-} clean_eval_scope = { NULL, 0 };
+} clean_eval_slots[KP_CLEAN_EVAL_SLOTS];
 
-/* Task-keyed and synchronous: only the task that entered the scope is
- * redirected.  The slot is advisory — if another task holds it we just fall
- * back to the live policy, so no atomicity is required. */
 static bool kp_clean_eval_enter(void)
 {
-    if (clean_eval_scope.task == current) {
-        clean_eval_scope.depth++;
-    } else if (!clean_eval_scope.task) {
-        clean_eval_scope.task = current;
-        clean_eval_scope.depth = 1;
-    } else {
-        return false;
+    int i;
+
+    for (i = 0; i < KP_CLEAN_EVAL_SLOTS; i++) {
+        if (__atomic_load_n(&clean_eval_slots[i].task, __ATOMIC_ACQUIRE) == current) {
+            clean_eval_slots[i].depth++;
+            return true;
+        }
     }
-    return true;
+    for (i = 0; i < KP_CLEAN_EVAL_SLOTS; i++) {
+        if (cmpxchg(&clean_eval_slots[i].task, NULL, current) == NULL) {
+            clean_eval_slots[i].depth = 1;
+            return true;
+        }
+    }
+    return false;
 }
 
 static void kp_clean_eval_leave(void)
 {
-    if (clean_eval_scope.task == current) {
-        if (clean_eval_scope.depth > 1) {
-            clean_eval_scope.depth--;
+    int i;
+
+    for (i = 0; i < KP_CLEAN_EVAL_SLOTS; i++) {
+        if (__atomic_load_n(&clean_eval_slots[i].task, __ATOMIC_ACQUIRE) != current) continue;
+        if (clean_eval_slots[i].depth > 1) {
+            clean_eval_slots[i].depth--;
         } else {
-            clean_eval_scope.depth = 0;
-            clean_eval_scope.task = NULL;
+            clean_eval_slots[i].depth = 0;
+            __atomic_store_n(&clean_eval_slots[i].task, NULL, __ATOMIC_RELEASE);
         }
+        return;
     }
 }
 
 static bool kp_clean_eval_active(void)
 {
-    return clean_eval_scope.task == current && clean_eval_scope.depth;
+    int i;
+
+    for (i = 0; i < KP_CLEAN_EVAL_SLOTS; i++) {
+        if (__atomic_load_n(&clean_eval_slots[i].task, __ATOMIC_ACQUIRE) == current &&
+            clean_eval_slots[i].depth)
+            return true;
+    }
+    return false;
 }
 
 int selinux_sepolicy_clean_eval_enter(void)
@@ -777,6 +820,28 @@ static bool kp_blob_looks_valid(const void *blob, size_t len)
     if (!blob || len < 4096 || len > (16u << 20)) return false;
     lib_memcpy(&magic, blob, sizeof(magic));
     return magic == KP_POLICYDB_MAGIC;
+}
+
+/* The serialized header, as policydb_read() parses it:
+ *   magic(4), strlen(4), "<POLICYDB_STRING>"(strlen), policyvers(4), config(4)
+ * POLICYDB_STRING is "SE Linux" on every kernel from 4.19 to 6.6, which puts
+ * config at 20 -- but deriving the offset from the length field means a kernel
+ * that ever changes the string cannot silently move allow_unknown into the
+ * middle of another field. */
+static bool kp_blob_config_word(const void *blob, size_t len, u32 *config)
+{
+    u32 magic = 0, slen = 0;
+    size_t off;
+
+    if (!blob || !config || len < 32) return false;
+    lib_memcpy(&magic, blob, sizeof(magic));
+    if (magic != KP_POLICYDB_MAGIC) return false;
+    lib_memcpy(&slen, (const char *)blob + 4, sizeof(slen));
+    if (!slen || slen > 64) return false;
+    off = 8 + (size_t)slen + sizeof(u32); /* skip magic + strlen + string + version */
+    if (off + sizeof(u32) > len) return false;
+    lib_memcpy(config, (const char *)blob + off, sizeof(*config));
+    return true;
 }
 
 static void kp_capture_policy_load(uint64_t ret)
@@ -1003,17 +1068,23 @@ static int kp_dup_sepolicy(void)
      * 4.19/5.4 layout, and on 5.10+ its offsets have drifted (embedded
      * hashtabs, compat_filename_trans_count, cond_list_len).  The copy is never
      * re-serialized, so the kernel-set fields are all we need.  Read the config
-     * bits from the blob instead (magic, string, version, config: offset 20). */
+     * bits from the serialized header instead (magic, string, version, config). */
     {
         u32 config = 0;
-        if (len >= 24) lib_memcpy(&config, (const char *)data + 20, sizeof(config));
-        g_backup_allow_unknown = (config & 0x4) != 0; /* ALLOW_UNKNOWN */
+
+        if (kp_blob_config_word(data, len, &config))
+            g_backup_allow_unknown = (config & 0x4) != 0; /* ALLOW_UNKNOWN */
+        else
+            logkfw("selinux_sepolicy: policy header unparsable, assuming deny_unknown\n");
     }
 
     rc = kp_policydb_load_isids(pdb, sidtab);
     if (rc) {
         log_boot("selinux_sepolicy: policydb_load_isids failed rc=%d\n", rc);
         if (kp_policydb_destroy) kp_policydb_destroy(pdb);
+        /* kp_policydb_load_isids() destroys the sidtab itself on every failure
+         * path it owns (sidtab_destroy in policydb.c), so it must not be
+         * destroyed again here. */
         goto out_free;
     }
 

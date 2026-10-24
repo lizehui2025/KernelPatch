@@ -56,7 +56,7 @@ bool selinux_sepolicy_snapshot_dirty(void);
 /* Redirect scope used by the < 5.0 path: while a task is inside it, the
  * string_to_context_struct / context_struct_compute_av hooks swap the live
  * policydb for the clean snapshot.  Enter returns 0 on success, -EAGAIN when
- * another task already holds the slot. */
+ * every slot is already owned by another task. */
 int selinux_sepolicy_clean_eval_enter(void);
 void selinux_sepolicy_clean_eval_leave(void);
 

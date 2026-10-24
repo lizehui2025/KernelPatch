@@ -61,7 +61,17 @@ extern int android_is_safe_mode;
 
 #define KP_O_RDONLY 0
 #define KP_PAGE_SIZE 4096
-#define KP_SIMPLE_TRANSACTION_LIMIT 4096
+/* selinuxfs writes answers into its transaction buffer, whose capacity is
+ * SIMPLE_TRANSACTION_LIMIT = PAGE_SIZE - sizeof(struct simple_transaction_argresp)
+ * (8 bytes), and simple_transaction_set() BUG_ON()s above it.  The bound must
+ * therefore follow the page size: a hardcoded 4096 is 8 bytes too large on a
+ * 4K-page kernel, and returning 4089..4096 bytes would be a kernel BUG rather
+ * than a truncated answer. */
+#define KP_TRANSACTION_ARGRESP 8
+static size_t kp_transaction_limit(void)
+{
+    return (page_size > 0 ? (size_t)page_size : (size_t)KP_PAGE_SIZE) - KP_TRANSACTION_ARGRESP;
+}
 #define KP_GFP_KERNEL 0xcc0u /* __GFP_RECLAIM | __GFP_IO | __GFP_FS */
 
 /* SELinux class / permission constants, matching
@@ -122,6 +132,12 @@ static bool g_hooked_context;
 static bool g_hooked_access;
 static bool g_hooked_status_read;
 static bool g_hooked_status_mmap;
+
+/* One-shot diagnostics for the fail-closed paths, so a busy redirect scope is
+ * visible in the boot log without flooding it. */
+static bool g_eval_busy_warned;
+static bool g_setprocattr_busy_warned;
+
 
 
 
@@ -500,27 +516,12 @@ static ssize_t kp_patch_response_seqno(char *buf, ssize_t ret, u32 new_seqno)
     return ret;
 }
 
-/* Should this app-side /access answer have its seqno rewritten to the clean
- * latest_granting?
- *
- * Yes for every app-side query.  The response's seqno is the policy's
- * latest_granting, and on this path the stock handler answers from the live
- * (reloaded N times) policy -- so any caller that is not rewritten reads the
- * real load count and can compare it with the fake status page.  The old code
- * only rewrote the exact `u:r:untrusted_app:s0 ... 0` shape, which let every
- * other carrier (app_zygote -- the only app domain allowed to query SELinux at
- * all --, isolated_app, sdk_sandbox, the per-app MLS categories, ...) keep the
- * live seqno.  The uid gate in the caller already limits this to apps.
- *
- * The decision bits are untouched: only the seqno token of the response is
- * replaced. */
-static bool kp_avd_seqno_probe(const char *scon,
-                               const char *tcon,
-                               u16 tclass)
-{
-    (void)tclass;
-    return scon && tcon;
-}
+/* The old `u:r:untrusted_app:s0` shape check (kp_avd_seqno_probe) is gone: it
+ * turned into "every app query", which made the live-policy probe path below
+ * swallow all access queries and left the clean-eval branch unreachable.  App
+ * queries are answered from the snapshot (>= 5.0 directly, < 5.0 through the
+ * redirect scope) and the seqno is rewritten on the way out.
+ */
 /* ---- app-facing selinuxfs query surface ----
  *
  * selinuxfs exposes the context-resolving transaction nodes context/access/
@@ -581,7 +582,7 @@ static ssize_t my_write_context_new(struct file *file, char *buf, size_t size)
     length = selinux_sepolicy_sid_to_context(sid, &canon, &len);
     if (length) return length;
 
-    if (len > KP_SIMPLE_TRANSACTION_LIMIT) {
+    if ((size_t)len > kp_transaction_limit()) {
         length = -ERANGE;
         goto out;
     }
@@ -613,9 +614,13 @@ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
         ret = orig_context_write(file, buf, size);
         selinux_sepolicy_clean_eval_leave();
     } else {
-        /* The redirect scope is held by another task; running the stock handler
-         * here would answer from the live (patched) policy and expose a hidden
-         * context.  Report a transient failure instead. */
+        /* All redirect slots are busy; running the stock handler here would
+         * answer from the live (patched) policy and expose a hidden context.
+         * Report a transient failure instead -- and say so once. */
+        if (!g_eval_busy_warned) {
+            g_eval_busy_warned = true;
+            logkfw("selinux_hide: context: redirect slots busy, query refused with -EAGAIN\n");
+        }
         return -EAGAIN;
     }
     if (ret > 0) kp_qlog("context_answer", uid, buf, (size_t)ret);
@@ -639,7 +644,7 @@ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
 
 static ssize_t kp_sel_reply(char *buf, const char *text)
 {
-    size_t limit = KP_SIMPLE_TRANSACTION_LIMIT - KP_SEL_RESPONSE_RESERVE;
+    size_t limit = kp_transaction_limit() - KP_SEL_RESPONSE_RESERVE;
     size_t n = lib_strlen(text);
 
     if (n >= limit) n = limit - 1;
@@ -715,42 +720,15 @@ static ssize_t my_write_access(struct file *file, char *buf, size_t size)
         return ret;
     }
 
-    {
-        char tmp[96];
-        char scon[64], tcon[64];
-        unsigned int allowed, decided,auditallow,auditdeny,seqno,flags;
-        u16 tclass = 0;
-        size_t tn = size < sizeof(tmp) - 1? size: sizeof(tmp) - 1;
-        lib_memcpy(tmp, buf, tn);
-        tmp[tn] = '\0';
-        if (sscanf(tmp, "%63s %63s %hu", scon, tcon, &tclass) == 3 &&
-            kp_avd_seqno_probe(scon, tcon, tclass)) {
-            ret = orig_access_write(file, buf, size);
-            if (ret > 0) {
-                if (sscanf(buf,"%x %x %x %x %u %x",&allowed,&decided,&auditallow,&auditdeny,&seqno,&flags) == 6) {
-                    ssize_t origin = ret;
-                    char out[96];
-                    seqno = KP_AVD_CLEAN_SEQNO;
-                    snprintf(out, sizeof(out), "%x %x %x %x %u %x",
-                             allowed, decided, auditallow, auditdeny, seqno, flags);
-                    ret = kp_sel_reply(buf, out);
-                    if (ret > 0 && (size_t)ret < size) {
-                        kp_qlog("access_answer(seqno probe)",uid, buf, (size_t)ret);
-                        logkfi("access_answer(seqno probe) uid=%u buf=%s,scon=%s,tcon=%s,tclass=%hu,origin=%zd,now=%zd,origin_buf=%s\n",
-                               (unsigned int)uid, buf, scon, tcon, tclass, origin, ret, tmp);
-                        return ret;
-                    }
-                }
-            }
-            return ret;
-        }
-    }
-
     if (selinux_sepolicy_clean_eval_enter() == 0) {
         ret = orig_access_write(file, buf, size);
         selinux_sepolicy_clean_eval_leave();
     } else {
         /* Never answer an app from the live policy: see my_write_context. */
+        if (!g_eval_busy_warned) {
+            g_eval_busy_warned = true;
+            logkfw("selinux_hide: access: redirect slots busy, query refused with -EAGAIN\n");
+        }
         return -EAGAIN;
     }
 
@@ -858,9 +836,18 @@ static int my_setprocattr(const char *name, void *value, size_t size)
         selinux_sepolicy_clean_eval_leave();
         return rc;
     }
-    /* The redirect scope is busy; running the stock handler here would resolve
-     * the context in the live policy. */
-    return -EAGAIN;
+    /* Every redirect slot is busy.  Refusing here would keep an app from
+     * setting its context at all (zygote writes attr/current for every fork and
+     * an error there fails the app launch), so fall back to the stock handler
+     * and say so once -- the same availability trade-off my_setprocattr_new()
+     * makes when the snapshot is unavailable.  Apps can only ever set contexts
+     * their own domain is allowed to enter, so the fallback exposes nothing a
+     * denied app could not already probe. */
+    if (!g_setprocattr_busy_warned) {
+        g_setprocattr_busy_warned = true;
+        logkfw("selinux_hide: setprocattr: redirect slots busy, using the stock path\n");
+    }
+    return orig_setprocattr(name, value, size);
 
 call_orig:
     return orig_setprocattr(name, value, size);
@@ -900,9 +887,9 @@ static ssize_t my_sel_read_handle_status(struct file *filp, char __user *buffer,
     return orig_sel_read_handle_status(filp, buffer, count, ppos);
 }
 
-/* ---- /sys/fs/selinux/status (read + mmap) ---- */
-
-/* The mapping contract of selinuxfs' status node (security/selinux/selinuxfs.c)
+/* ---- /sys/fs/selinux/status mmap ----
+ *
+ * The mapping contract of selinuxfs' status node (security/selinux/selinuxfs.c)
  * is part of the ABI libselinux relies on:
  *
  *   - mmap() rejects `vm_pgoff != 0` and `vm_end - vm_start != PAGE_SIZE` with
@@ -980,9 +967,11 @@ static int kp_vma_pgoff(struct vm_area_struct *vma, void *filp, unsigned long *p
 
     for (i = 3; i < KP_VMA_SCAN_WORDS; i++) {
         if (kp_untag_addr(w[i]) != want) continue;
-        /* The word before vm_file is vm_ops: NULL for selinuxfs' status node,
-         * otherwise a pointer into the kernel image (.rodata included, which is
-         * why kp_is_kernel_text() alone was too strict). */
+        /* vm_ops sits two words before vm_file (the layout is vm_ops,
+         * vm_pgoff, vm_file): NULL for selinuxfs' status node, otherwise a
+         * pointer into the kernel image (.rodata included, which is why
+         * kp_is_kernel_text() alone was too strict).  The word in between is
+         * the vm_pgoff this function returns. */
         if (w[i - 2] && !kp_is_kernel_ptr(kp_untag_addr(w[i - 2]))) continue;
         *pgoff = w[i - 1];
         return 0;
@@ -1123,29 +1112,37 @@ static int kp_install_fp_slot(uintptr_t slot, void *replace, void **backup, cons
 }
 
 
-/* A handler slot is only patched when it currently holds a kernel text address:
- * with a wrong index the patch then falls back instead of redirecting a data
- * field (e.g. the write slot of sel_handle_status_ops, which is NULL). */
+/* A handler slot is only patched when it currently holds a kernel text
+ * address: with a wrong index the patch then falls back instead of redirecting
+ * a data field (e.g. the write slot of sel_handle_status_ops, which is NULL).
+ *
+ * The index itself cannot be checked by identity here: this path only runs when
+ * the handler symbol could not be resolved, so there is no address to compare
+ * with.  A wrong-but-occupied index would therefore still redirect another
+ * handler, which is why the inline hook is tried first and the slot path logs
+ * that its index is unverified. */
 static bool kp_slot_is_handler(uintptr_t slot)
 {
     if (!slot || is_bad_address((void *)slot)) return false;
     return kp_is_kernel_text(*(unsigned long *)slot);
 }
 
-static uintptr_t kp_found_write_op_slot(unsigned long write_op, unsigned long index)
+static uintptr_t kp_found_write_op_slot(unsigned long write_op, unsigned long index, const char *name)
 {
     sel_write_op_fn *w = (sel_write_op_fn *)write_op;
     if (!write_op || is_bad_address((void *)write_op) || !index) return 0;
-    if (!is_bad_address(&w[index]) && kp_slot_is_handler((uintptr_t)&w[index])) return (uintptr_t)&w[index];
-    return 0;
+    if (is_bad_address(&w[index]) || !kp_slot_is_handler((uintptr_t)&w[index])) return 0;
+    logkfw("selinux_hide: %s: write_op[%lu] is an unverified handler slot\n", name, index);
+    return (uintptr_t)&w[index];
 }
 
-static uintptr_t kp_find_fops_slot(unsigned long ops, unsigned long index)
+static uintptr_t kp_find_fops_slot(unsigned long ops, unsigned long index, const char *name)
 {
     unsigned long *p = (unsigned long *)ops;
     if (!ops || is_bad_address((void *)ops) || !index) return 0;
-    if (!is_bad_address(&p[index]) && kp_slot_is_handler((uintptr_t)&p[index])) return (uintptr_t)&p[index];
-    return 0;
+    if (is_bad_address(&p[index]) || !kp_slot_is_handler((uintptr_t)&p[index])) return 0;
+    logkfw("selinux_hide: %s: fops[%lu] is an unverified handler slot\n", name, index);
+    return (uintptr_t)&p[index];
 }
 
 /* struct file_operations slot indices.
@@ -1162,8 +1159,14 @@ static uintptr_t kp_find_fops_slot(unsigned long ops, unsigned long index)
  * The anchor is required.  Without it the layout cannot be established, and a
  * guessed slot would redirect a live handler -- on 6.18 index 2 is ->llseek and
  * holds a text pointer, so kp_slot_is_handler() alone would not catch it.  When
- * generic_file_llseek is unavailable the slot path is skipped and logged; the
- * inline hook remains the primary path.
+ * the anchor is missing the slot path is skipped and logged; the inline hook
+ * remains the primary path.
+ *
+ * CONFIG_CFI_CLANG (GKI sets it) makes the anchor comparison fail by design:
+ * the struct holds the CFI jump-table entry while kallsyms reports the function
+ * entry.  That only costs the fallback -- the inline hook patches text and is
+ * unaffected -- so it is logged as such instead of being worked around with a
+ * guessed index.
  */
 #define KP_FOPS_SCAN 24
 
@@ -1255,7 +1258,7 @@ static int selinux_hide_install_hooks(void)
         if (rc) goto err;
         g_hooked_context = true;
     }else{
-        slot = kp_found_write_op_slot(write_op, SEL_WRITE_OP_CONTEXT);
+        slot = kp_found_write_op_slot(write_op, SEL_WRITE_OP_CONTEXT, "sel_write_context");
         if (slot) {
             kp_install_fp_slot(slot, (void *)my_write_context, (void **)&orig_context_write,"sel_write_context");
             log_boot("selinux_hide: installed fp slot for sel_write_context\n");
@@ -1272,7 +1275,7 @@ static int selinux_hide_install_hooks(void)
         if (rc) goto err;
         g_hooked_access = true;
     }else{
-        slot = kp_found_write_op_slot(write_op, SEL_WRITE_OP_ACCESS);
+        slot = kp_found_write_op_slot(write_op, SEL_WRITE_OP_ACCESS, "sel_write_access");
         if (slot) {
             kp_install_fp_slot(slot, (void *)my_write_access, (void **)&orig_access_write,"sel_write_access");
             log_boot("selinux_hide: installed fp slot for sel_write_access\n");
@@ -1306,8 +1309,9 @@ static int selinux_hide_install_hooks(void)
     }else{
         // ssize_t (*read) (struct file *, char __user *, size_t, loff_t *);
         if (!read_idx)
-            logkfw("selinux_hide: status read slot: generic_file_llseek unresolved, slot path skipped\n");
-        slot = read_idx ? kp_find_fops_slot(status_ops, read_idx) : 0;
+            logkfw("selinux_hide: status read slot: sel_handle_status_ops has no anchor for "
+                   "generic_file_llseek (CFI jump table?), slot path skipped\n");
+        slot = read_idx ? kp_find_fops_slot(status_ops, read_idx, "sel_read_handle_status") : 0;
         if (slot) {
             rc = kp_install_fp_slot(slot, (void *)my_sel_read_handle_status, (void **)&orig_sel_read_handle_status,
                                     "sel_read_handle_status");
@@ -1328,8 +1332,9 @@ static int selinux_hide_install_hooks(void)
     }else{
         // int (*mmap) (struct file *, struct vm_area_struct *);
         if (!mmap_idx)
-            logkfw("selinux_hide: status mmap slot: generic_file_llseek unresolved, slot path skipped\n");
-        slot = mmap_idx ? kp_find_fops_slot(status_ops, mmap_idx) : 0;
+            logkfw("selinux_hide: status mmap slot: sel_handle_status_ops has no anchor for "
+                   "generic_file_llseek (CFI jump table?), slot path skipped\n");
+        slot = mmap_idx ? kp_find_fops_slot(status_ops, mmap_idx, "sel_mmap_handle_status") : 0;
         if (slot) {
             rc = kp_install_fp_slot(slot, (void *)my_sel_mmap_handle_status, (void **)&orig_sel_mmap_handle_status,
                                     "sel_mmap_handle_status");
@@ -1342,10 +1347,19 @@ static int selinux_hide_install_hooks(void)
     }
     /* Both transaction nodes are the feature's core: enabling with either one
      * missing would report "enabled" while that query still reaches the live
-     * (patched) policy.  Fail closed so the manager can see it did not work. */
+     * (patched) policy.  The status page is just as core now that its handlers
+     * fail closed: an app that reads or mmaps /sys/fs/selinux/status would get
+     * -ENODEV, which no stock device ever returns, so a missing page or hook is
+     * a detection and a functional break rather than a degraded feature. */
     if (!g_hooked_context || !g_hooked_access) {
         logkfw("selinux_hide: transaction hooks unavailable (context=%d access=%d), not enabling\n",
                g_hooked_context, g_hooked_access);
+        rc = -ENOENT;
+        goto err;
+    }
+    if (!fake_status_vaddr || !g_hooked_status_read || !g_hooked_status_mmap) {
+        logkfw("selinux_hide: status surface incomplete (page=%d read=%d mmap=%d), not enabling\n",
+               fake_status_vaddr != NULL, g_hooked_status_read, g_hooked_status_mmap);
         rc = -ENOENT;
         goto err;
     }
