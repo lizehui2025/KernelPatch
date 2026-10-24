@@ -418,6 +418,65 @@ void kp_vfree(const void *addr)
     if (kfunc(vfree)) kfunc(vfree)(addr);
 }
 
+/* ---- payload allocation for the query helpers ----
+ *
+ * kmalloc() is a static inline since 5.10: there is no symbol to resolve and the
+ * misc ksym pass never fills kfunc(kmalloc).  Relying on it made every
+ * intercepted query answer -ENOSYS, which broke the /proc/self/attr/current
+ * write that every app spawn performs -- no app process could start and the
+ * device hung on the boot animation.  Resolve the real symbol instead
+ * (__kmalloc on 6.x, __kmalloc_noprof on the noprof kernels, kmalloc only on
+ * 4.19/5.4) and keep vmalloc as a last resort rather than failing.
+ */
+typedef void *(*kp_kmalloc_fn)(size_t, gfp_t);
+typedef void (*kp_kfree_fn)(const void *);
+
+static kp_kmalloc_fn kp_payload_kmalloc;
+static kp_kfree_fn kp_payload_kfree;
+static bool kp_payload_resolved;
+
+static void kp_payload_resolve(void)
+{
+    if (kp_payload_resolved) return;
+    kp_payload_resolved = true;
+
+    kp_payload_kmalloc = (kp_kmalloc_fn)lookup_name_with_suffix("__kmalloc");
+    if (!kp_payload_kmalloc) kp_payload_kmalloc = (kp_kmalloc_fn)lookup_name_with_suffix("__kmalloc_noprof");
+    if (!kp_payload_kmalloc) kp_payload_kmalloc = (kp_kmalloc_fn)lookup_name_with_suffix("kmalloc");
+    kp_payload_kfree = (kp_kfree_fn)lookup_name_with_suffix("kfree");
+    log_boot("selinux_sepolicy: payload allocator: %s, free: %s\n",
+             kp_payload_kmalloc ? "kmalloc" : "vmalloc", kp_payload_kfree ? "kfree" : "none");
+}
+
+static void *kp_payload_alloc(size_t size, gfp_t gfp, bool *via_vmalloc)
+{
+    kp_payload_resolve();
+    if (kp_payload_kmalloc) {
+        *via_vmalloc = false;
+        return kp_payload_kmalloc(size, gfp);
+    }
+    *via_vmalloc = true;
+    return kp_vmalloc(size);
+}
+
+static void kp_payload_free(void *p, bool via_vmalloc)
+{
+    if (!p) return;
+    if (via_vmalloc) kp_vfree(p);
+    else if (kp_payload_kfree) kp_payload_kfree(p);
+}
+
+/* Free a string the kernel allocated for us (context_struct_to_string() or the
+ * sidtab sid2str copy).  kfunc(kfree) is NULL for the same reason as
+ * kfunc(kmalloc) -- kfree has no misc ksym match -- so the old call site leaked
+ * one canonical string per accepted query. */
+void kp_kernel_str_free(void *p)
+{
+    if (!p) return;
+    kp_payload_resolve();
+    if (kp_payload_kfree) kp_payload_kfree(p);
+}
+
 /* ---- resolved symbols ---- */
 
 typedef int (*policydb_read_fn)(struct policydb *p, struct policy_file *fp);
@@ -990,10 +1049,10 @@ static int kp_context_to_sid_with_policy(const char *scontext, u32 scontext_len,
      * implementation fingerprint, so mirror stock: one kmalloc of len + 1.  The
      * payload is capped by selinuxfs' own SIMPLE_TRANSACTION_LIMIT anyway. */
     char *scontext2;
+    bool via_vmalloc = false;
 
     if (scontext_len >= KP_CONTEXT_PAYLOAD_LIMIT) return -EINVAL;
-    if (!kfunc(kmalloc)) return -ENOSYS;
-    scontext2 = kfunc(kmalloc)(scontext_len + 1, gfp);
+    scontext2 = kp_payload_alloc(scontext_len + 1, gfp, &via_vmalloc);
     if (!scontext2) return -ENOMEM;
     lib_memcpy(scontext2, scontext, scontext_len);
     scontext2[scontext_len] = '\0';
@@ -1001,7 +1060,7 @@ static int kp_context_to_sid_with_policy(const char *scontext, u32 scontext_len,
     rc = kp_string_to_context_struct(policydb, sidtab, scontext2, &context, def_sid);
     if (!rc)
         rc = kp_sidtab_context_to_sid(sidtab, &context, out_sid);
-    if (kfunc(kfree)) kfunc(kfree)(scontext2);
+    kp_payload_free(scontext2, via_vmalloc);
     return rc;
 }
 
@@ -1158,6 +1217,7 @@ int selinux_sepolicy_init(void)
     kp_context_struct_to_string = (context_struct_to_string_fn)lookup_name_with_suffix("context_struct_to_string");
     kp_sidtab_search_core = (sidtab_search_core_fn)lookup_name_with_suffix("sidtab_search_core");
     kp_context_struct_compute_av = (context_struct_compute_av_fn)lookup_name_with_suffix("context_struct_compute_av");
+    kp_payload_resolve();
     if (!selinux_hide_is_new_version()) {
         /* Only the argument-redirect hooks are needed: the deep copy is consumed by
         * swapping the policydb argument while an app query runs. */

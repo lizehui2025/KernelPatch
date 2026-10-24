@@ -35,6 +35,11 @@ struct av_decision;
 void *kp_vmalloc(unsigned long size);
 void kp_vfree(const void *addr);
 
+/* Free a string the kernel allocated for a context (context_struct_to_string()
+ * or the sidtab sid2str copy).  Needed because kfunc(kfree) is never resolved:
+ * free is not in the misc ksym match table. */
+void kp_kernel_str_free(void *p);
+
 /* Install anything needed once at boot. */
 int selinux_sepolicy_init(void);
 

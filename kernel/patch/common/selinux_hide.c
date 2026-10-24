@@ -212,7 +212,8 @@ static u32 kp_live_enforcing(void)
 
     if (off == -2) off = kp_btf_member_offset("selinux_state", "enforcing");
     if (!addr) addr = lookup_name_with_suffix("selinux_state");
-    if (!addr || off < 0) return 1;
+    /* Refuse a nonsense offset instead of reading outside the struct. */
+    if (!addr || off < 0 || off > 120) return 1;
     return *(volatile u8 *)(addr + (unsigned long)off) ? 1 : 0;
 }
 
@@ -588,7 +589,7 @@ static ssize_t my_write_context_new(struct file *file, char *buf, size_t size)
     lib_memcpy(buf, canon, len);
     length = (ssize_t)len;
 out:
-    if (canon && kfunc(kfree)) kfunc(kfree)(canon);
+    if (canon) kp_kernel_str_free(canon);
     return length;
 }
 static ssize_t my_write_context(struct file *file, char *buf, size_t size)
@@ -765,6 +766,9 @@ static ssize_t my_write_access(struct file *file, char *buf, size_t size)
 /* ---- setprocattr handler ---- */
 
 
+/* One-shot warning for the "snapshot machinery is missing" fallback below. */
+static bool g_setprocattr_infra_warned;
+
 static int my_setprocattr_new(const char *name, void *value, size_t size)
 {
     uid_t uid = current_uid();
@@ -812,6 +816,21 @@ static int my_setprocattr_new(const char *name, void *value, size_t size)
          * clean device would not have: for a denied app the stock handler stops
          * at its own permission check before resolving anything. */
         error = selinux_sepolicy_context_to_sid(value, size, &sid, KP_GFP_KERNEL);
+        /* -ENOSYS means the snapshot machinery is unavailable (symbols not
+         * resolved, snapshot not built).  Failing here would keep every app
+         * process from setting its context, i.e. no app could start at all, so
+         * fall through to the stock handler in that case instead of failing
+         * closed -- and say so, exactly once.  A genuine policy "unknown
+         * context" is -EINVAL and still fails closed. */
+        if (error == -ENOSYS || error == -EOPNOTSUPP) {
+            if (!g_setprocattr_infra_warned) {
+                g_setprocattr_infra_warned = true;
+                logkfw("selinux_hide: snapshot unavailable (%d), app context transitions fall "
+                       "back to the stock path\n",
+                       error);
+            }
+            goto call_orig;
+        }
         if (error) return error;
     }
 
