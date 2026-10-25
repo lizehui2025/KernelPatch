@@ -1,3 +1,7 @@
 parse_equiv
 _fastpath_extract.h
 sectime2
+attrprobe
+bench_parse
+sectest
+sectime
