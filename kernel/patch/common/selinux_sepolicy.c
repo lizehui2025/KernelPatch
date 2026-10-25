@@ -1132,6 +1132,30 @@ int selinux_sepolicy_context_to_sid(const char *scontext, u32 scontext_len, u32 
     return kp_context_to_sid_with_policy(scontext, scontext_len, out_sid, SECSID_NULL, gfp);
 }
 
+int selinux_sepolicy_context_to_sid_inplace(char *scontext, u32 scontext_len, u32 *out_sid)
+{
+    struct policydb *policydb;
+    void *sidtab;
+    struct context context;
+    int rc;
+
+    /* Same guards and the same verdicts as kp_context_to_sid_with_policy(); the
+     * only difference is that the payload is not duplicated first.  The caller
+     * owns the buffer and promises the trailing NUL the parse relies on. */
+    if (!g_backup_ready) return -ENOSYS;
+    policydb = kp_backup_policydb();
+    sidtab = kp_backup_sidtab();
+    if (!policydb || !sidtab || !scontext || !scontext_len) return -EINVAL;
+    if (!kp_string_to_context_struct || !kp_sidtab_context_to_sid) return -ENOSYS;
+    if (scontext_len >= KP_CONTEXT_PAYLOAD_LIMIT) return -EINVAL;
+    if (scontext[scontext_len] != '\0') return -EINVAL;
+
+    rc = kp_string_to_context_struct(policydb, sidtab, scontext, &context, SECSID_NULL);
+    if (!rc)
+        rc = kp_sidtab_context_to_sid(sidtab, &context, out_sid);
+    return rc;
+}
+
 int selinux_sepolicy_sid_to_context(u32 sid, char **scontext, u32 *scontext_len)
 {
     if (!g_backup_ready) return -ENOSYS;

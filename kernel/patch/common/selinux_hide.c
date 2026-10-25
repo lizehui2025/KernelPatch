@@ -363,6 +363,32 @@ static int kp_context_to_sid_clean(const char *scontext, u32 scontext_len, u32 *
     return rc;
 }
 
+/*
+ * The same verdict, resolved from a caller-owned writable scratch buffer.
+ *
+ * The snapshot lookup tokenizes its input in place, so the variant above makes
+ * a private copy of the payload for every query.  A caller that already parsed
+ * the payload into a stack buffer can hand over a copy instead and save the
+ * allocator round trip; `work` must hold scontext_len + 1 bytes, and `scontext`
+ * stays intact because the live lookup below still needs the original text.
+ *
+ * The decision itself must not change: only an accepted context is registered
+ * in the live policy (see kp_context_to_sid_clean).
+ */
+static int kp_context_to_sid_clean_buf(char *work, const char *scontext, u32 scontext_len, u32 *sid)
+{
+    u32 live_sid = SECSID_NULL;
+    int rc;
+
+    *sid = SECSID_NULL;
+    lib_memcpy(work, scontext, scontext_len);
+    work[scontext_len] = '\0';
+    rc = selinux_sepolicy_context_to_sid_inplace(work, scontext_len, sid);
+    if (!rc)
+        (void)security_context_to_sid_fn(scontext, scontext_len, &live_sid, KP_GFP_KERNEL);
+    return rc;
+}
+
 static ssize_t kp_patch_response_seqno(char *buf, ssize_t ret, u32 new_seqno)
 {
     char *p = buf, *end = buf + ret, *tok_start;
@@ -519,10 +545,9 @@ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
 
 #define KP_SEL_RESPONSE_RESERVE 64
 
-static ssize_t kp_sel_reply(char *buf, const char *text)
+static ssize_t kp_sel_reply(char *buf, const char *text, size_t n)
 {
     size_t limit = kp_transaction_limit() - KP_SEL_RESPONSE_RESERVE;
-    size_t n = lib_strlen(text);
 
     if (n >= limit) n = limit - 1;
     lib_memcpy(buf, text, n);
@@ -530,10 +555,121 @@ static ssize_t kp_sel_reply(char *buf, const char *text)
     return (ssize_t)n;
 }
 
+/* ---- access payload: the two libc calls this path used to make ----
+ *
+ * Everything on this path is timed by whoever submits the query, so the cost of
+ * the parser and of the formatter is part of the signal.  The stock handler
+ * parses with sscanf("%255s %255s %hu") and prints with
+ * snprintf("%x %x %x %x %u %x"); both run a full conversion engine per call,
+ * which is a large share of what a query costs here.
+ *
+ * The fast parser deliberately handles only the input shape a real query has --
+ * two whitespace-separated context strings and a plain decimal class -- and
+ * reports failure for everything else (a field at the 255-byte width limit, a
+ * signed or wrapped class, a missing field).  Those fall back to the exact
+ * vsscanf call the handler used before, so malformed input -- the shape a
+ * detector is most likely to probe with -- keeps the kernel's own behaviour.
+ */
+
+static bool kp_is_query_sep(char c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
+}
+
+/* One "%255s" field; false when the field is empty or would be cut by the
+ * width limit, so neither case is decided by this code. */
+static bool kp_read_query_word(const char **pp, char *dst)
+{
+    const char *p = *pp;
+    u32 n = 0;
+
+    while (kp_is_query_sep(*p)) p++;
+    while (*p && !kp_is_query_sep(*p)) {
+        if (n == 255) return false;
+        dst[n++] = *p++;
+    }
+    if (!n) return false;
+    dst[n] = '\0';
+    *pp = p;
+    return true;
+}
+
+static bool kp_parse_access_fast(const char *buf, char *scon, char *tcon, u16 *tclass)
+{
+    const char *p = buf;
+    u32 v = 0;
+
+    if (!kp_read_query_word(&p, scon)) return false;
+    if (!kp_read_query_word(&p, tcon)) return false;
+
+    while (kp_is_query_sep(*p)) p++;
+    if (*p < '0' || *p > '9') return false;
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10 + (u32)(*p++ - '0');
+        if (v > 0xffff) return false;
+    }
+    *tclass = (u16)v;
+    return true;
+}
+
+static u32 kp_put_hex(u32 v, char *dst)
+{
+    static const char hex[] = "0123456789abcdef";
+    char tmp[8];
+    u32 i = 0, n = 0;
+
+    if (!v) {
+        dst[0] = '0';
+        return 1;
+    }
+    while (v) {
+        tmp[i++] = hex[v & 0xf];
+        v >>= 4;
+    }
+    while (i) dst[n++] = tmp[--i];
+    return n;
+}
+
+static u32 kp_put_dec(u32 v, char *dst)
+{
+    char tmp[10];
+    u32 i = 0, n = 0;
+
+    if (!v) {
+        dst[0] = '0';
+        return 1;
+    }
+    while (v) {
+        tmp[i++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (i) dst[n++] = tmp[--i];
+    return n;
+}
+
+/* snprintf(out, 96, "%x %x %x %x %u %x", ...) without the format engine. */
+static ssize_t kp_format_avd(char *out, size_t cap, const struct av_decision *avd)
+{
+    u32 n = 0;
+
+    if (cap < 64) {
+        return snprintf(out, cap, "%x %x %x %x %u %x",
+                        avd->allowed, 0xffffffff, avd->auditallow, avd->auditdeny,
+                        avd->seqno, avd->flags);
+    }
+    n += kp_put_hex(avd->allowed, out + n);    out[n++] = ' ';
+    n += kp_put_hex(0xffffffffu, out + n);     out[n++] = ' ';
+    n += kp_put_hex(avd->auditallow, out + n); out[n++] = ' ';
+    n += kp_put_hex(avd->auditdeny, out + n);  out[n++] = ' ';
+    n += kp_put_dec(avd->seqno, out + n);      out[n++] = ' ';
+    n += kp_put_hex(avd->flags, out + n);
+    return (ssize_t)n;
+}
+
 static ssize_t my_write_access_new(struct file *file, char *buf, size_t size)
 {
     uid_t uid = current_uid();
-    char scon[256], tcon[256];
+    char scon[256], tcon[256], work[256];
     struct av_decision avd;
     u32 ssid, tsid, sconlen, tconlen;
     u16 tclass = 0;
@@ -551,7 +687,9 @@ static ssize_t my_write_access_new(struct file *file, char *buf, size_t size)
     length = kp_avc_check(KP_SECINITSID_SECURITY, KP_SECCLASS_SECURITY, KP_SECURITY__COMPUTE_AV);
     if (length) return length;
 
-    if (sscanf(buf, "%255s %255s %hu", scon, tcon, &tclass) != 3) return -EINVAL;
+    if (!kp_parse_access_fast(buf, scon, tcon, &tclass)) {
+        if (sscanf(buf, "%255s %255s %hu", scon, tcon, &tclass) != 3) return -EINVAL;
+    }
 
     sconlen = lib_strlen(scon);
     tconlen = lib_strlen(tcon);
@@ -561,10 +699,10 @@ static ssize_t my_write_access_new(struct file *file, char *buf, size_t size)
      * give.  Each accepted context is registered in the live policy as well,
      * exactly like the stock handler's own conversions do; a rejected one is
      * not, see kp_context_to_sid_clean. */
-    length = kp_context_to_sid_clean(scon, sconlen, &ssid);
+    length = kp_context_to_sid_clean_buf(work, scon, sconlen, &ssid);
     if (length) return length;
 
-    length = kp_context_to_sid_clean(tcon, tconlen, &tsid);
+    length = kp_context_to_sid_clean_buf(work, tcon, tconlen, &tsid);
     if (length) return length;
 
     lib_memset(&avd, 0, sizeof(avd));
@@ -574,10 +712,7 @@ static ssize_t my_write_access_new(struct file *file, char *buf, size_t size)
 
     {
         char out[96];
-        snprintf(out, sizeof(out), "%x %x %x %x %u %x",
-                 avd.allowed, 0xffffffff, avd.auditallow, avd.auditdeny,
-                 avd.seqno, avd.flags);
-        return kp_sel_reply(buf, out);
+        return kp_sel_reply(buf, out, (size_t)kp_format_avd(out, sizeof(out), &avd));
     }
 }
 static ssize_t my_write_access(struct file *file, char *buf, size_t size)
