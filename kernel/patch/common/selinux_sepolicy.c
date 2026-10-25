@@ -1234,11 +1234,13 @@ int selinux_sepolicy_init(void)
      * (state, data, len, load_state). */
     addr = lookup_name_with_suffix("security_load_policy");
     if (addr) {
-        if (selinux_hide_is_without_sepolicy_state_version())
-            hook_wrap3((void *)addr, NULL, after_security_load_policy_3, NULL);
-        else
-            hook_wrap4((void *)addr, NULL, after_security_load_policy_4, NULL);
-        log_boot("selinux_sepolicy: hooked security_load_policy @ %llx\n", addr);
+        /* Idempotent: selinux_sepolicy_boot_init() already installs this hook as
+         * early as possible.  Hooking here again would stack a second layer,
+         * which leaks its trampoline and runs every capture twice -- two 2 MB
+         * blob copies and one needless vmalloc/vfree round trip per policy
+         * load.  The boot log showed exactly that (two "captured clean policy
+         * blob" lines for the same length). */
+        kp_install_load_hook();
     }
 
     log_boot("selinux_sepolicy: read=%llx str2ctx=%llx sidtab2sid=%llx search=%llx\n",
