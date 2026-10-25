@@ -52,6 +52,18 @@ void selinux_sepolicy_clean_eval_leave(void);
 
 /* Query helpers that answer against the deep copy. */
 int selinux_sepolicy_context_to_sid(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp);
+
+/*
+ * Same lookup, resolved in place.  string_to_context_struct() tokenizes its
+ * input with strsep(), so the by-value entry point above has to copy the
+ * payload into a fresh buffer first; a caller that already parsed the payload
+ * into its own writable stack buffer skips that copy (__kmalloc + memcpy +
+ * kfree), which was the largest avoidable cost on the access query path.
+ *
+ * `scontext` must be writable for scontext_len + 1 bytes, NUL terminated at
+ * scontext[scontext_len], and must not be needed intact afterwards.
+ */
+int selinux_sepolicy_context_to_sid_inplace(char *scontext, u32 scontext_len, u32 *out_sid);
 int selinux_sepolicy_sid_to_context(u32 sid, char **scontext, u32 *scontext_len);
 int selinux_sepolicy_context_str_to_sid(const char *scontext, u32 *out_sid, gfp_t gfp);
 void selinux_sepolicy_compute_av_user(u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);
