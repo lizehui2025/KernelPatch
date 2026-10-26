@@ -81,7 +81,19 @@ L1 能关掉的原因是判定顺序：`context` 先做权限检查（`check_con
 ## 5. 逐段计时
 
 日志等级设成 `verbose`（control state = 2）后，两个 hook 会为每条 app 查询打印一行
-纳秒级分段；等级为 `off`/`on` 时整块只是对 `KP_QLOG_VERBOSE` 的一次比较。
+纳秒级分段；等级为 `off`/`on` 时整块只是两次比较。
+
+管理器界面目前只暴露“开 / 关”两档，够不到 `verbose`。想用一次刷机拿到数据，可以编一个
+带预算的诊断 kpimg：
+
+```sh
+make TARGET_COMPILE=aarch64-linux-gnu- ANDROID=1 \
+     CFLAGS="... -DANDROID -DKP_TRACE_BUDGET=500" kpimg
+```
+
+`KP_TRACE_BUDGET=N` 让开机后的前 N 次 app 查询打印分段、然后自动停止；正常构建里它是 0，
+这块只剩两次比较。刷入诊断 kpimg、跑一轮 attrprobe、用 `dmesg | grep 'stage '` 取数，
+再刷回正常 kpimg。
 
 ```
 stage context uid=10443 size=33 log=0 avc=... snap=... live=... sid2str=... copy=... total=...
