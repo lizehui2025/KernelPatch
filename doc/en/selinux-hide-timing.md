@@ -94,8 +94,20 @@ So the goal can only be to shrink the constants, not to reach zero.
 ## 5. Per-stage timing
 
 With the query log at `verbose` (control state 2) both hooks print one nanosecond
-breakdown per app query; at `off`/`on` the whole block is a single comparison
-against `KP_QLOG_VERBOSE`.
+breakdown per app query; at `off`/`on` the whole block is two comparisons.
+
+The manager UI only exposes on/off today and cannot reach `verbose`. To get the
+numbers from a single flash, build a kpimg with a budget:
+
+```sh
+make TARGET_COMPILE=aarch64-linux-gnu- ANDROID=1 \
+     CFLAGS="... -DANDROID -DKP_TRACE_BUDGET=500" kpimg
+```
+
+`KP_TRACE_BUDGET=N` makes the first N app queries after boot print their stages and
+then stop; a normal build keeps it at 0, where the block is two comparisons. Flash
+the diagnostic kpimg, run one attrprobe pass, read `dmesg | grep 'stage '`, then
+flash the normal kpimg back.
 
 ```
 stage context uid=10443 size=33 log=0 avc=... snap=... live=... sid2str=... copy=... total=...

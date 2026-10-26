@@ -175,9 +175,17 @@ static void kp_qlog_plain(const char *what, uid_t uid)
  * a decision: the stage values land in the globals below and a query that was
  * not traced simply leaves them untouched.
  */
+/* Diagnostic builds set KP_TRACE_BUDGET to attribute their first N app queries
+ * without a manager that can reach the verbose level; a normal build leaves it
+ * at zero and the whole block is two comparisons. */
+#ifndef KP_TRACE_BUDGET
+#define KP_TRACE_BUDGET 0
+#endif
+static int g_trace_budget = KP_TRACE_BUDGET;
+
 static bool kp_trace_stages(void)
 {
-    return selinux_hide_query_log == KP_QLOG_VERBOSE;
+    return selinux_hide_query_log == KP_QLOG_VERBOSE || g_trace_budget > 0;
 }
 
 typedef long long (*kp_clock_fn)(void);
@@ -587,6 +595,7 @@ out:
                (unsigned int)uid, (unsigned int)size, t_log - t0, t_avc - t_log,
                g_stage_snap_ns, g_stage_live_ns, t_end - t_sid, t_copy - t_end,
                t_copy - t0);
+        if (g_trace_budget > 0) g_trace_budget--;
     }
     if (canon) kp_kernel_str_free(canon);
     return length;
@@ -820,6 +829,7 @@ static ssize_t my_write_access_new(struct file *file, char *buf, size_t size)
                    (unsigned int)uid, (unsigned int)size, t_log - t0, t_avc - t_log,
                    t_parse - t_avc, snap_s, live_s, snap_t, live_t,
                    t_conv - t_parse, t_avd - t_conv, t_end - t_avd, t_end - t0);
+            if (g_trace_budget > 0) g_trace_budget--;
         }
         return reply;
     }
