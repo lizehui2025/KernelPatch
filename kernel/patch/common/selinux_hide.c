@@ -63,6 +63,12 @@ static size_t kp_transaction_limit(void)
 }
 #define KP_GFP_KERNEL 0xcc0u /* __GFP_RECLAIM | __GFP_IO | __GFP_FS */
 
+/* Stack scratch for the snapshot lookup: the payload is tokenized in place, so
+ * the handler needs a writable copy of it.  A context string is a few dozen
+ * bytes, this covers every real query and the oversized ones fall back to the
+ * allocating variant, which has the same verdicts. */
+#define KP_CONTEXT_SCRATCH 512
+
 /* SELinux class / permission constants, matching
  * security/selinux/include/classmap.h (class numbers are 1-based indices). */
 #define KP_SECCLASS_SECURITY 1
@@ -157,6 +163,41 @@ static void kp_qlog_plain(const char *what, uid_t uid)
     if (selinux_hide_query_log == KP_QLOG_OFF) return;
     logkfi("query %s uid=%u\n", what, (unsigned int)uid);
 }
+
+/* ---- per-stage attribution ----
+ *
+ * An app that submits a selinuxfs query times it with its own clock, so the only
+ * way to know which part of an answer costs what is to measure it on this side.
+ * With the query log at KP_QLOG_VERBOSE each hooked handler stamps ktime_get()
+ * around its stages and prints one line per query, in nanoseconds.  At
+ * KP_QLOG_ON or below the whole block costs one comparison against
+ * KP_QLOG_VERBOSE, so the numbers are collected only on demand and never change
+ * a decision: the stage values land in the globals below and a query that was
+ * not traced simply leaves them untouched.
+ */
+static bool kp_trace_stages(void)
+{
+    return selinux_hide_query_log == KP_QLOG_VERBOSE;
+}
+
+typedef long long (*kp_clock_fn)(void);
+static kp_clock_fn kp_clock_ns;
+
+/* Nanoseconds on the monotonic clock the kernel's own tracing uses.  A missing
+ * symbol turns the stamps into zeros, which shows up as zero deltas in the log
+ * instead of as a bogus attribution. */
+static long long kp_now_ns(void)
+{
+    if (!kp_clock_ns)
+        kp_clock_ns = (kp_clock_fn)lookup_name_with_suffix("ktime_get");
+    if (!kp_clock_ns)
+        kp_clock_ns = (kp_clock_fn)lookup_name_with_suffix("local_clock");
+    return kp_clock_ns ? kp_clock_ns() : 0;
+}
+
+/* Filled by kp_context_to_sid_clean_buf() while stages are traced. */
+static long long g_stage_snap_ns;
+static long long g_stage_live_ns;
 
 /* Read by selinux_sepolicy.c for its level-2 (internal redirect) logging. */
 int selinux_hide_query_log_level(void)
@@ -378,14 +419,23 @@ static int kp_context_to_sid_clean(const char *scontext, u32 scontext_len, u32 *
 static int kp_context_to_sid_clean_buf(char *work, const char *scontext, u32 scontext_len, u32 *sid)
 {
     u32 live_sid = SECSID_NULL;
+    bool trace = kp_trace_stages();
+    long long t0 = trace ? kp_now_ns() : 0;
+    long long t1 = 0;
     int rc;
 
     *sid = SECSID_NULL;
     lib_memcpy(work, scontext, scontext_len);
     work[scontext_len] = '\0';
     rc = selinux_sepolicy_context_to_sid_inplace(work, scontext_len, sid);
-    if (!rc)
+    if (trace) t1 = kp_now_ns();
+    if (!rc) {
         (void)security_context_to_sid_fn(scontext, scontext_len, &live_sid, KP_GFP_KERNEL);
+        if (trace) g_stage_live_ns = kp_now_ns() - t1;
+    } else if (trace) {
+        g_stage_live_ns = 0;
+    }
+    if (trace) g_stage_snap_ns = t1 - t0;
     return rc;
 }
 
@@ -469,14 +519,20 @@ static ssize_t my_write_context_new(struct file *file, char *buf, size_t size)
 {
 
     uid_t uid = current_uid();
+    char scratch[KP_CONTEXT_SCRATCH];
     char *canon = NULL;
     u32 sid, len;
     ssize_t length;
+    bool trace = kp_trace_stages();
+    long long t0 = 0, t_log = 0, t_avc = 0, t_sid = 0, t_end = 0;
+
+    if (trace) t0 = kp_now_ns();
 
     /* Before the permission check on purpose: the log is what makes detector
      * probes visible, and its cost depends only on the payload length, so two
      * equal-length writes cannot be told apart through it. */
     kp_qlog("context_write", uid, buf, size);
+    if (trace) t_log = kp_now_ns();
 
     if (likely(uid < 10000)) {
         length = orig_context_write(file, buf, size);
@@ -490,14 +546,30 @@ static ssize_t my_write_context_new(struct file *file, char *buf, size_t size)
      * can never leak into the canonical answer -- no symbol-redirect scope,
      * no silent fallback to the live policy. */
     length = kp_avc_check(KP_SECINITSID_SECURITY, KP_SECCLASS_SECURITY, KP_SECURITY__CHECK_CONTEXT);
+    if (trace) t_avc = kp_now_ns();
     if (length) return length;
 
-    length = kp_context_to_sid_clean(buf, size, &sid);
+    /* The snapshot lookup tokenizes its payload in place, so the query needs a
+     * writable copy of it.  A stack buffer covers every real context string and
+     * saves an allocator round trip per query; an oversized payload keeps the
+     * allocating variant, whose verdicts are identical. */
+    if (trace) {
+        /* Mark "not attributed" so an oversized payload cannot report the
+         * previous query's stage times. */
+        g_stage_snap_ns = -1;
+        g_stage_live_ns = -1;
+    }
+    if (size < sizeof(scratch))
+        length = kp_context_to_sid_clean_buf(scratch, buf, (u32)size, &sid);
+    else
+        length = kp_context_to_sid_clean(buf, size, &sid);
+    if (trace) t_sid = kp_now_ns();
     if (length) {
         return length;
     }
 
     length = selinux_sepolicy_sid_to_context(sid, &canon, &len);
+    if (trace) t_end = kp_now_ns();
     if (length) return length;
 
     if ((size_t)len > kp_transaction_limit()) {
@@ -508,6 +580,14 @@ static ssize_t my_write_context_new(struct file *file, char *buf, size_t size)
     lib_memcpy(buf, canon, len);
     length = (ssize_t)len;
 out:
+    if (trace) {
+        long long t_copy = kp_now_ns();
+        logkfi("stage context uid=%u size=%u log=%lld avc=%lld snap=%lld live=%lld "
+               "sid2str=%lld copy=%lld total=%lld\n",
+               (unsigned int)uid, (unsigned int)size, t_log - t0, t_avc - t_log,
+               g_stage_snap_ns, g_stage_live_ns, t_end - t_sid, t_copy - t_end,
+               t_copy - t0);
+    }
     if (canon) kp_kernel_str_free(canon);
     return length;
 }
@@ -674,8 +754,13 @@ static ssize_t my_write_access_new(struct file *file, char *buf, size_t size)
     u32 ssid, tsid, sconlen, tconlen;
     u16 tclass = 0;
     ssize_t length;
+    bool trace = kp_trace_stages();
+    long long t0 = 0, t_log = 0, t_avc = 0, t_parse = 0, t_conv = 0, t_avd = 0;
+    long long snap_s = 0, live_s = 0, snap_t = 0, live_t = 0;
 
+    if (trace) t0 = kp_now_ns();
     kp_qlog("access_write", uid, buf, size);
+    if (trace) t_log = kp_now_ns();
 
     if (likely(uid < 10000)) {
         length = orig_access_write(file, buf, size);
@@ -685,11 +770,13 @@ static ssize_t my_write_access_new(struct file *file, char *buf, size_t size)
     }
 
     length = kp_avc_check(KP_SECINITSID_SECURITY, KP_SECCLASS_SECURITY, KP_SECURITY__COMPUTE_AV);
+    if (trace) t_avc = kp_now_ns();
     if (length) return length;
 
     if (!kp_parse_access_fast(buf, scon, tcon, &tclass)) {
         if (sscanf(buf, "%255s %255s %hu", scon, tcon, &tclass) != 3) return -EINVAL;
     }
+    if (trace) t_parse = kp_now_ns();
 
     sconlen = lib_strlen(scon);
     tconlen = lib_strlen(tcon);
@@ -700,19 +787,41 @@ static ssize_t my_write_access_new(struct file *file, char *buf, size_t size)
      * exactly like the stock handler's own conversions do; a rejected one is
      * not, see kp_context_to_sid_clean. */
     length = kp_context_to_sid_clean_buf(work, scon, sconlen, &ssid);
+    if (trace) {
+        snap_s = g_stage_snap_ns;
+        live_s = g_stage_live_ns;
+    }
     if (length) return length;
 
     length = kp_context_to_sid_clean_buf(work, tcon, tconlen, &tsid);
+    if (trace) {
+        snap_t = g_stage_snap_ns;
+        live_t = g_stage_live_ns;
+        t_conv = kp_now_ns();
+    }
     if (length) return length;
 
     lib_memset(&avd, 0, sizeof(avd));
     avd.auditdeny = 0xffffffff;
     selinux_sepolicy_compute_av_user(ssid, tsid, tclass, &avd);
     avd.seqno = KP_AVD_CLEAN_SEQNO;
+    if (trace) t_avd = kp_now_ns();
 
     {
         char out[96];
-        return kp_sel_reply(buf, out, (size_t)kp_format_avd(out, sizeof(out), &avd));
+        ssize_t n = (ssize_t)kp_format_avd(out, sizeof(out), &avd);
+        ssize_t reply = kp_sel_reply(buf, out, (size_t)n);
+
+        if (trace) {
+            long long t_end = kp_now_ns();
+            logkfi("stage access uid=%u size=%u log=%lld avc=%lld parse=%lld "
+                   "scon(snap=%lld live=%lld) tcon(snap=%lld live=%lld) conv=%lld "
+                   "avd=%lld fmt=%lld total=%lld\n",
+                   (unsigned int)uid, (unsigned int)size, t_log - t0, t_avc - t_log,
+                   t_parse - t_avc, snap_s, live_s, snap_t, live_t,
+                   t_conv - t_parse, t_avd - t_conv, t_end - t_avd, t_end - t0);
+        }
+        return reply;
     }
 }
 static ssize_t my_write_access(struct file *file, char *buf, size_t size)
@@ -761,6 +870,7 @@ static int my_setprocattr_new(const char *name, void *value, size_t size)
     u32 mysid, sid;
     char *str = value;
     char vbuf[96];
+    char scratch[KP_CONTEXT_SCRATCH];
     int error;
 
     /* KernelSU my_setprocattr: apps may only transition to contexts that the
@@ -801,7 +911,16 @@ static int my_setprocattr_new(const char *name, void *value, size_t size)
          * live policy out of this path also keeps it free of side effects a
          * clean device would not have: for a denied app the stock handler stops
          * at its own permission check before resolving anything. */
-        error = selinux_sepolicy_context_to_sid(value, size, &sid, KP_GFP_KERNEL);
+        if (size < sizeof(scratch)) {
+            /* Same verdict, without the kstrdup the allocating variant needs:
+             * the payload is tokenized in place, so it is copied to the stack
+             * instead.  `value` stays untouched for the stock handler below. */
+            lib_memcpy(scratch, value, size);
+            scratch[size] = '\0';
+            error = selinux_sepolicy_context_to_sid_inplace(scratch, (u32)size, &sid);
+        } else {
+            error = selinux_sepolicy_context_to_sid(value, size, &sid, KP_GFP_KERNEL);
+        }
         if (error == -ENOSYS || error == -EOPNOTSUPP) {
             if (!g_setprocattr_infra_warned) {
                 g_setprocattr_infra_warned = true;
