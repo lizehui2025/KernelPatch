@@ -24,6 +24,12 @@ X86_LD ?= ld
 X86_OBJCOPY ?= objcopy
 
 CFLAGS += -Wall -fno-builtin -std=gnu11 -nostdinc -mgeneral-regs-only -ffixed-x18
+# kpimg is copied to a runtime base WITHOUT a relocation pass, so it must not
+# carry a GOT/PLT (the linker script rejects one) and must not reference a stack
+# guard: -fno-pic/-fno-pie keeps every access PC-relative or link-relative, and
+# -fno-stack-protector avoids an unresolved __stack_chk_guard in a freestanding
+# image.
+CFLAGS += -fno-stack-protector -fno-pic -fno-pie
 CFLAGS += -g
 
 # kpimg-x86 links at 0 and runs from wherever it was injected, and the linker
