@@ -29,7 +29,9 @@ L1 能关掉的原因是判定顺序：`context` 先做权限检查（`check_con
 2. `kp_avc_check(SECURITY__CHECK_CONTEXT)`：`security_cred_getsecid()` + `avc_has_perm()`
 3. 快照解析：payload 拷进可写缓冲（现在优先栈缓冲）→ `string_to_context_struct()`
    （就地分词 + 策略哈希查找）→ `sidtab_context_to_sid()`
-4. live 注册：`security_context_to_sid()`，内部还要 `kstrdup` 一次、自己再分词一次
+4. live 注册：同一份 payload 再对 live 策略解析一次、然后插 live sidtab，用调用方的
+   栈缓冲、在一次 RCU 临界区里完成；拿不到 live 策略锚点（低于 6.6、没有 BTF、没有 RCU
+   入口）的内核回退到 `security_context_to_sid()`，那里还要 `kstrdup` 一次、再分词一次
 5. `sid_to_context()`：sidtab 查找 + `sid2str`（首次分配并缓存，之后命中缓存）
 6. 把规范串 `memcpy` 回内核缓冲
 
@@ -63,7 +65,7 @@ L1 能关掉的原因是判定顺序：`context` 先做权限检查（`check_con
 | 编号 | 信道 | 现状 | 说明 |
 | --- | --- | --- | --- |
 | R1 | `context` 成功路径比失败路径贵 | 存在 | 快照解析 + live 注册 + sid2str + 拷贝；stock 也贵，我们更贵 |
-| R2 | `access` 双倍策略工作 | 存在 | 两个上下文各一次“快照 + live”，stock 只做一次 live |
+| R2 | `access` 双倍策略工作 | 已缩小 | 两个上下文各一次“快照 + live 注册”，stock 只做一次 live；注册不再复制 payload、不再重新解析策略 |
 | R3 | `attr/current` accept 慢约 8% | 存在 | 来自快照解析；权限被拒时不发生 |
 | R4 | `sid2str` 冷热 | 存在 | 首次分配并缓存，之后命中；同一 pid 重复查询能看到台阶 |
 | R5 | 日志开关 | 运维项 | 等级 `on`/`verbose` 时 `logkfi` 的成本远大于查询本身，测时间前必须关 |
@@ -102,11 +104,22 @@ stage access  uid=10443 size=57 log=0 avc=... parse=... scon(snap=... live=...)
 ```
 
 - `snap`：快照解析（就地分词 + sidtab 查找）
-- `live`：live 策略注册那一次 `security_context_to_sid()`
+- `live`：live 注册——对 live 策略解析一次并插 sidtab；回退路径上才是 `security_context_to_sid()`
+  那次转换
 - `sid2str`：反向取规范串（含首次分配）
 - `conv`：两个上下文转换的合计（`access`）
 - `avd`：`compute_av` 与字段填充
 - `fmt`：格式化与回复
+
+开机日志会写一次当前模式，两条路径的 `live` 数值不可直接对比：
+
+```
+selinux_hide: live sidtab: direct (policy +0x8, sidtab +0x0, policydb +0x8)
+selinux_hide: live sidtab: security_context_to_sid (kver 60a00b, no selinux_policy)
+```
+
+`direct` 需要 6.6+、BTF，以及 kallsyms 里的 `__rcu_read_lock`/`__rcu_read_unlock`；其余情况
+保持旧转换，并写明原因。
 
 `g_stage_*` 只在该等级下写入，且不参与任何判定；超长 payload 走分配路线时两项打 `-1`，
 表示这次没有分段。

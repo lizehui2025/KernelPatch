@@ -408,6 +408,9 @@ static int kp_context_to_sid_clean(const char *scontext, u32 scontext_len, u32 *
     *sid = SECSID_NULL;
     rc = selinux_sepolicy_context_to_sid(scontext, scontext_len, sid, KP_GFP_KERNEL);
     if (!rc)
+        /* Oversized payload: there is no caller-owned scratch to parse twice, so
+         * the live registration keeps the stock conversion.  The stack variant
+         * below is the one every real context goes through. */
         (void)security_context_to_sid_fn(scontext, scontext_len, &live_sid, KP_GFP_KERNEL);
     return rc;
 }
@@ -438,7 +441,13 @@ static int kp_context_to_sid_clean_buf(char *work, const char *scontext, u32 sco
     rc = selinux_sepolicy_context_to_sid_inplace(work, scontext_len, sid);
     if (trace) t1 = kp_now_ns();
     if (!rc) {
-        (void)security_context_to_sid_fn(scontext, scontext_len, &live_sid, KP_GFP_KERNEL);
+        /* The live registration parses the same payload against the live policy
+         * on this same buffer: no allocator round trip, no second full
+         * conversion through security_context_to_sid(), one RCU section
+         * instead of a nested one.  -EOPNOTSUPP means this kernel exposes no
+         * anchor for the live policy, and then the old conversion stays. */
+        if (selinux_sepolicy_live_register(work, scontext, scontext_len) == -EOPNOTSUPP)
+            (void)security_context_to_sid_fn(scontext, scontext_len, &live_sid, KP_GFP_KERNEL);
         if (trace) g_stage_live_ns = kp_now_ns() - t1;
     } else if (trace) {
         g_stage_live_ns = 0;

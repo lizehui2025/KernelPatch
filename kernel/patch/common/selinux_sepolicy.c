@@ -35,6 +35,7 @@
 #include <kallsyms.h>
 #include <hook.h>
 #include <predata.h>
+#include <kbtf.h>
 #include <kputils.h>
 #include <baselib.h>
 #include <linux/slab.h>
@@ -1126,6 +1127,195 @@ static void kp_compute_av_user_with_policy(u32 ssid, u32 tsid, u16 tclass, struc
     kp_context_struct_compute_av(policydb, scontext, tcontext, tclass, avd, NULL);
 }
 
+/* ---- live sidtab registration ----
+ *
+ * A context the deep copy accepts must also land in the live sidtab: that is
+ * what the stock handler does when it converts a context, and the entry count
+ * of the live table is readable through /sys/fs/selinux/ss/sidtab_hash_stats,
+ * so an insert that never happens is just as visible as one that happens for a
+ * name a clean device does not have.  Only accepted contexts are registered --
+ * a name the copy rejects must not grow the live table (KernelSU a810677b,
+ * "fix sidtab detection").
+ *
+ * The insert used to be a second, full conversion through
+ * security_context_to_sid(): that call copied the payload again, resolved the
+ * live policy again and took its own RCU section, so a hidden query paid two
+ * conversions where stock pays one.  With the anchor of the live policy known,
+ * the same parse and the same insert run here instead, inside one RCU section,
+ * on a buffer the caller already owns:
+ *
+ *     rcu_read_lock
+ *         state->policy  ->  struct selinux_policy { *sidtab, policydb }
+ *         string_to_context_struct(&policy->policydb, policy->sidtab, work, ...)
+ *         sidtab_context_to_sid(policy->sidtab, ...)
+ *     rcu_read_unlock
+ *
+ * Nothing is guessed: the offsets come from BTF, the policy pointer is read
+ * under RCU exactly where the stock conversion reads it, and a kernel without
+ * BTF, without those members or without the RCU entry points keeps the old
+ * conversion (kp_live_mode == KP_LIVE_UNAVAILABLE).  No verdict changes: the
+ * answer always comes from the copy, and a name the live policy does not know
+ * simply does not grow its table.
+ */
+
+enum
+{
+    KP_LIVE_UNPROBED = 0,
+    KP_LIVE_DIRECT,
+    KP_LIVE_UNAVAILABLE,
+};
+
+static int kp_live_mode;
+static unsigned long kp_live_state;
+static long kp_live_state_policy_off = -2;
+static long kp_live_policy_sidtab_off = -2;
+static long kp_live_policy_policydb_off = -2;
+static long kp_live_policydb_vers_off = -2;
+static bool kp_live_mismatch_warned;
+static void (*kp_rcu_read_lock)(void);
+static void (*kp_rcu_read_unlock)(void);
+
+struct kp_live_policy
+{
+    struct policydb *policydb;
+    void *sidtab;
+};
+
+static bool kp_live_offset_ok(long off)
+{
+    return off >= 0 && off <= 4096 && (off & 7) == 0;
+}
+
+/* Resolved once, from init and again on the first query if init did not run.
+ * Anything that does not resolve cleanly leaves the stock conversion in place,
+ * and says so once. */
+static void kp_live_resolve(void)
+{
+    long state_policy_off, sidtab_off, policydb_off;
+
+    if (kp_live_mode != KP_LIVE_UNPROBED) return;
+    kp_live_mode = KP_LIVE_UNAVAILABLE;
+
+    /* struct selinux_policy, and the ss/ helpers that take it, exist from 6.6
+     * on (selinux_state.policy); below that the live tables sit in selinux_ss,
+     * where the stock conversion stays. */
+    if (!selinux_hide_is_without_sepolicy_state_version()) {
+        log_boot("selinux_hide: live sidtab: security_context_to_sid (kver %x, no selinux_policy)\n", kver);
+        return;
+    }
+    if (!kp_btf_available()) {
+        logkfw("selinux_hide: live sidtab: no BTF, keeping security_context_to_sid\n");
+        return;
+    }
+
+    state_policy_off = kp_btf_member_offset("selinux_state", "policy");
+    sidtab_off = kp_btf_member_offset("selinux_policy", "sidtab");
+    policydb_off = kp_btf_member_offset("selinux_policy", "policydb");
+    kp_live_policydb_vers_off = kp_btf_member_offset("policydb", "policyvers");
+    kp_live_state = lookup_name_with_suffix("selinux_state");
+    kp_rcu_read_lock = (void (*)(void))lookup_name_with_suffix("__rcu_read_lock");
+    kp_rcu_read_unlock = (void (*)(void))lookup_name_with_suffix("__rcu_read_unlock");
+
+    if (!kp_live_offset_ok(state_policy_off) || !kp_live_offset_ok(sidtab_off) ||
+        !kp_live_offset_ok(policydb_off)) {
+        logkfw("selinux_hide: live sidtab: BTF offsets unavailable (%ld/%ld/%ld), keeping "
+               "security_context_to_sid\n",
+               state_policy_off, sidtab_off, policydb_off);
+        return;
+    }
+    if (!kp_live_state) {
+        logkfw("selinux_hide: live sidtab: selinux_state not found, keeping security_context_to_sid\n");
+        return;
+    }
+    if (!kp_rcu_read_lock || !kp_rcu_read_unlock) {
+        logkfw("selinux_hide: live sidtab: rcu entry points not in kallsyms, keeping "
+               "security_context_to_sid\n");
+        return;
+    }
+    if (!kp_string_to_context_struct || !kp_sidtab_context_to_sid) {
+        logkfw("selinux_hide: live sidtab: ss/ symbols missing, keeping security_context_to_sid\n");
+        return;
+    }
+
+    kp_live_state_policy_off = state_policy_off;
+    kp_live_policy_sidtab_off = sidtab_off;
+    kp_live_policy_policydb_off = policydb_off;
+    kp_live_mode = KP_LIVE_DIRECT;
+    log_boot("selinux_hide: live sidtab: direct (policy +0x%lx, sidtab +0x%lx, policydb +0x%lx)\n",
+             (unsigned long)state_policy_off, (unsigned long)sidtab_off, (unsigned long)policydb_off);
+}
+
+/* Caller holds kp_rcu_read_lock(), so the policy it returns cannot be replaced
+ * (the load path publishes it with rcu_assign_pointer() and frees the previous
+ * one only after a grace period). */
+static bool kp_live_policy_get(struct kp_live_policy *out)
+{
+    unsigned long base;
+    void *policy = *(void **)(kp_live_state + (unsigned long)kp_live_state_policy_off);
+
+    if (!policy || is_bad_address(policy)) return false;
+    base = (unsigned long)policy;
+    out->sidtab = *(void **)(base + (unsigned long)kp_live_policy_sidtab_off);
+    out->policydb = (struct policydb *)(base + (unsigned long)kp_live_policy_policydb_off);
+    if (!out->sidtab || is_bad_address(out->sidtab)) return false;
+    return true;
+}
+
+/* The member layout is the one struct selinux_policy has had since 6.4: the
+ * sidtab pointer first, then the policydb by value.  Nothing about that is
+ * typed at runtime, so verify it before trusting a parse: the live policydb and
+ * the copy must agree on the policy format version, and both read it at the
+ * same BTF offset because both were written in the kernel's own layout.  A
+ * kernel that disagrees keeps the old conversion instead of parsing through a
+ * misread pointer. */
+static bool kp_live_layout_ok(const struct kp_live_policy *live)
+{
+    struct policydb *copy = kp_backup_policydb();
+    u32 live_vers, copy_vers;
+
+    if (!copy || kp_live_policydb_vers_off < 0 || kp_live_policydb_vers_off > 4096) return true;
+    live_vers = *(u32 *)((char *)live->policydb + kp_live_policydb_vers_off);
+    copy_vers = *(u32 *)((char *)copy + kp_live_policydb_vers_off);
+    if (live_vers == copy_vers) return true;
+
+    if (!kp_live_mismatch_warned) {
+        kp_live_mismatch_warned = true;
+        logkfw("selinux_hide: live sidtab: policyvers %u vs %u, keeping security_context_to_sid\n",
+               live_vers, copy_vers);
+    }
+    kp_live_mode = KP_LIVE_UNAVAILABLE;
+    return false;
+}
+
+int selinux_sepolicy_live_register(char *work, const char *scontext, u32 scontext_len)
+{
+    struct kp_live_policy live;
+    struct context context;
+    u32 sid = SECSID_NULL;
+    int rc;
+
+    kp_live_resolve();
+    if (kp_live_mode != KP_LIVE_DIRECT) return -EOPNOTSUPP;
+    if (!work || !scontext || !scontext_len) return -EINVAL;
+    if (scontext_len >= KP_CONTEXT_PAYLOAD_LIMIT) return -EINVAL;
+
+    lib_memcpy(work, scontext, scontext_len);
+    work[scontext_len] = '\0';
+
+    kp_rcu_read_lock();
+    if (!kp_live_policy_get(&live) || !kp_live_layout_ok(&live)) {
+        kp_rcu_read_unlock();
+        return -EOPNOTSUPP;
+    }
+    rc = kp_string_to_context_struct(live.policydb, live.sidtab, work, &context, SECSID_NULL);
+    if (!rc) {
+        rc = kp_sidtab_context_to_sid(live.sidtab, &context, &sid);
+        if (kp_context_destroy) kp_context_destroy(&context);
+    }
+    kp_rcu_read_unlock();
+    return rc;
+}
+
 /* ---- public query dispatch ----
  * All of them answer through the ss/ wrappers on top of the deep copy, so the
  * same code serves every supported kernel; a wrapper whose symbols did not
@@ -1222,6 +1412,7 @@ int selinux_sepolicy_init(void)
     kp_sidtab_search_core = (sidtab_search_core_fn)lookup_name_with_suffix("sidtab_search_core");
     kp_context_struct_compute_av = (context_struct_compute_av_fn)lookup_name_with_suffix("context_struct_compute_av");
     kp_context_destroy = (context_destroy_fn)lookup_name_with_suffix("context_destroy");
+    kp_live_resolve();
     kp_payload_resolve();
     if (!selinux_hide_is_new_version()) {
         /* Only the argument-redirect hooks are needed: the deep copy is consumed by

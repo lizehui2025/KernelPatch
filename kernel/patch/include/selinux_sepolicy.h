@@ -64,6 +64,21 @@ int selinux_sepolicy_context_to_sid(const char *scontext, u32 scontext_len, u32 
  * scontext[scontext_len], and must not be needed intact afterwards.
  */
 int selinux_sepolicy_context_to_sid_inplace(char *scontext, u32 scontext_len, u32 *out_sid);
+
+/*
+ * Register a context the copy accepted in the live policy, the way the stock
+ * handler's own conversion registers it: parse against the live policydb,
+ * insert into the live sidtab.  `work` is a caller-owned writable buffer of
+ * scontext_len + 1 bytes; the payload is copied into it and tokenized in
+ * place, so `scontext` stays intact and no allocator is used.
+ *
+ * Returns 0 when the live table already held the context or now does,
+ * -EOPNOTSUPP when this kernel exposes no anchor for the live policy (the
+ * caller then falls back to the security_context_to_sid() conversion), and the
+ * live policy's own error otherwise.  None of them changes the answer, which
+ * always comes from the copy.
+ */
+int selinux_sepolicy_live_register(char *work, const char *scontext, u32 scontext_len);
 int selinux_sepolicy_sid_to_context(u32 sid, char **scontext, u32 *scontext_len);
 int selinux_sepolicy_context_str_to_sid(const char *scontext, u32 *out_sid, gfp_t gfp);
 void selinux_sepolicy_compute_av_user(u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);

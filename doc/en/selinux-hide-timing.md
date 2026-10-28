@@ -34,8 +34,11 @@ There is nothing to make *equal* on that layer, only constants to shrink.
 3. snapshot parse: payload copied into a writable buffer (now preferably the stack)
    -> `string_to_context_struct()` (in-place tokenising plus policy hash lookup)
    -> `sidtab_context_to_sid()`
-4. live registration: `security_context_to_sid()`, which duplicates the string with
-   `kstrdup` and tokenises it a second time
+4. live registration: the same payload parsed against the live policy plus the
+   sidtab insert, on the caller's scratch buffer and inside one RCU section.
+   Kernels that expose no anchor for the live policy (below 6.6, no BTF, no RCU
+   entry points) fall back to `security_context_to_sid()`, which duplicates the
+   string with `kstrdup` and tokenises it a second time
 5. `sid_to_context()`: sidtab lookup plus `sid2str` (allocated and cached on first
    use, cached afterwards)
 6. `memcpy` of the canonical string back into the kernel buffer
@@ -74,7 +77,7 @@ How to read it:
 | Id | Channel | State | Note |
 | --- | --- | --- | --- |
 | R1 | `context` success costs more than failure | present | snapshot parse + live registration + sid2str + copy; stock also pays for success, this pays more |
-| R2 | `access` does the policy work twice | present | one snapshot plus one live conversion per context, where stock does one live conversion |
+| R2 | `access` does the policy work twice | reduced | one snapshot plus one live registration per context, where stock does one live conversion; the registration no longer copies the payload or re-resolves the policy |
 | R3 | `attr/current` accept is ~8% slower | present | comes from the snapshot parse; does not happen when the permission is denied |
 | R4 | `sid2str` cold/warm | present | allocated and cached on first use; repeated queries from one pid show a step |
 | R5 | the query log | operational | at `on`/`verbose`, `logkfi` costs far more than the query itself; switch it off before timing |
@@ -116,7 +119,18 @@ stage access  uid=10443 size=57 log=0 avc=... parse=... scon(snap=... live=...)
 ```
 
 - `snap`: snapshot parse (in-place tokenising plus sidtab lookup)
-- `live`: the `security_context_to_sid()` that registers the context in the live policy
+- `live`: the live registration -- parse against the live policy plus the sidtab
+  insert; on the fallback path this is the `security_context_to_sid()` conversion
+
+The boot log names the mode once, because the two numbers are not comparable:
+
+```
+selinux_hide: live sidtab: direct (policy +0x8, sidtab +0x0, policydb +0x8)
+selinux_hide: live sidtab: security_context_to_sid (kver 60a00b, no selinux_policy)
+```
+
+`direct` needs 6.6+, BTF and `__rcu_read_lock`/`__rcu_read_unlock` in kallsyms;
+anything else keeps the conversion and says why.
 - `sid2str`: reverse lookup of the canonical string (including the first allocation)
 - `conv`: both context conversions together (`access`)
 - `avd`: `compute_av` and field filling
