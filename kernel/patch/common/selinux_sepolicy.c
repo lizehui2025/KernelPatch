@@ -46,7 +46,12 @@
 #include <uapi/asm-generic/errno.h>
 #include <security/selinux/include/security.h>
 #include <security/selinux/include/avc.h>
+#include <kbtf.h>
 #include <selinux_hide.h>
+
+#ifdef KP_SELINUX_HIDE_SELFTEST
+void selinux_hide_selftest_on_policy_load(void);
+#endif
 
 /* ---- constants ---- */
 
@@ -59,343 +64,7 @@
 #define KP_GFP_KERNEL 0xcc0u /* __GFP_RECLAIM | __GFP_IO | __GFP_FS */
 #define KP_CONTEXT_PAYLOAD_LIMIT 4096
 
-/* ---- SELinux ss/ structures (layouts from the kpm selinux_hook module) ---- */
-
-struct policy_file
-{
-    char *data;
-    size_t len;
-};
-
-struct flex_array;
-struct hashtab;
-
-struct symtab
-{
-    struct hashtab *table;
-    u32 nprim;
-};
-
-enum
-{
-    SELINUX_EBITMAP_NODE_SIZE = 64,
-    SELINUX_EBITMAP_UNIT_BITS = sizeof(unsigned long) * 8,
-    SELINUX_EBITMAP_UNIT_NUMS = (SELINUX_EBITMAP_NODE_SIZE - sizeof(void *) - sizeof(u32)) /
-                                sizeof(unsigned long),
-};
-
-struct ebitmap_node
-{
-    struct ebitmap_node *next;
-    unsigned long maps[SELINUX_EBITMAP_UNIT_NUMS];
-    u32 startbit;
-};
-
-struct ebitmap
-{
-    struct ebitmap_node *node;
-    u32 highbit;
-};
-
-struct mls_level
-{
-    u32 sens;
-    struct ebitmap cat;
-};
-
-struct mls_range
-{
-    struct mls_level level[2];
-};
-
-struct context
-{
-    u32 user;
-    u32 role;
-    u32 type;
-    u32 len;
-    struct mls_range range;
-    char *str;
-    u32 hash;
-};
-
-struct constraint_expr
-{
-    u32 expr_type;
-    u32 attr;
-    u32 op;
-    struct ebitmap names;
-    struct type_set *type_names;
-    struct constraint_expr *next;
-};
-
-struct constraint_node
-{
-    u32 permissions;
-    struct constraint_expr *expr;
-    struct constraint_node *next;
-};
-
-struct common_datum
-{
-    u32 value;
-    struct symtab permissions;
-};
-
-struct class_datum
-{
-    u32 value;
-    char *comkey;
-    struct common_datum *comdatum;
-    struct symtab permissions;
-    struct constraint_node *constraints;
-    struct constraint_node *validatetrans;
-    char default_user;
-    char default_role;
-    char default_type;
-    char default_range;
-};
-
-struct role_datum
-{
-    u32 value;
-    u32 bounds;
-    struct ebitmap dominates;
-    struct ebitmap types;
-};
-
-struct role_trans
-{
-    u32 role;
-    u32 type;
-    u32 tclass;
-    u32 new_role;
-    struct role_trans *next;
-};
-
-struct filename_trans
-{
-    u32 stype;
-    u32 ttype;
-    u16 tclass;
-    const char *name;
-};
-
-struct role_allow
-{
-    u32 role;
-    u32 new_role;
-    struct role_allow *next;
-};
-
-struct type_datum
-{
-    u32 value;
-    u32 bounds;
-    unsigned char primary;
-    unsigned char attribute;
-};
-
-struct user_datum
-{
-    u32 value;
-    u32 bounds;
-    struct ebitmap roles;
-    struct mls_range range;
-    struct mls_level dfltlevel;
-};
-
-struct level_datum
-{
-    struct mls_level *level;
-    unsigned char isalias;
-};
-
-struct cat_datum
-{
-    u32 value;
-    unsigned char isalias;
-};
-
-struct range_trans
-{
-    u32 source_type;
-    u32 target_type;
-    u32 target_class;
-};
-
-struct cond_bool_datum
-{
-    u32 value;
-    int state;
-};
-
-struct cond_node;
-
-struct type_set
-{
-    struct ebitmap types;
-    struct ebitmap negset;
-    u32 flags;
-};
-
-struct ocontext
-{
-    union
-    {
-        char *name;
-        struct
-        {
-            u8 protocol;
-            u16 low_port;
-            u16 high_port;
-        } port;
-        struct
-        {
-            u32 addr;
-            u32 mask;
-        } node;
-        struct
-        {
-            u32 addr[4];
-            u32 mask[4];
-        } node6;
-        struct
-        {
-            u64 subnet_prefix;
-            u16 low_pkey;
-            u16 high_pkey;
-        } ibpkey;
-        struct
-        {
-            char *dev_name;
-            u8 port;
-        } ibendport;
-    } u;
-    union
-    {
-        u32 sclass;
-        u32 behavior;
-    } v;
-    struct context context[2];
-    u32 sid[2];
-    struct ocontext *next;
-};
-
-struct genfs
-{
-    char *fstype;
-    struct ocontext *head;
-    struct genfs *next;
-};
-
-struct avtab_key
-{
-    u16 source_type;
-    u16 target_type;
-    u16 target_class;
-    u16 specified;
-};
-
-#define AVTAB_ALLOWED 0x0001
-#define AVTAB_AUDITALLOW 0x0002
-#define AVTAB_AUDITDENY 0x0004
-#define AVTAB_XPERMS_ALLOWED 0x0100
-#define AVTAB_XPERMS_AUDITALLOW 0x0200
-#define AVTAB_XPERMS_DONTAUDIT 0x0400
-
-struct avtab_extended_perms
-{
-    u8 specified;
-    u8 driver;
-    struct extended_perms_data perms;
-};
-
-struct avtab_datum
-{
-    union
-    {
-        u32 data;
-        struct avtab_extended_perms *xperms;
-    } u;
-};
-
-struct avtab_node
-{
-    struct avtab_key key;
-    struct avtab_datum datum;
-    struct avtab_node *next;
-};
-
-struct avtab
-{
-    struct flex_array *htable;
-    u32 nel;
-    u32 nslot;
-    u32 mask;
-};
-
-#define SYM_COMMONS 0
-#define SYM_CLASSES 1
-#define SYM_ROLES 2
-#define SYM_TYPES 3
-#define SYM_USERS 4
-#define SYM_BOOLS 5
-#define SYM_LEVELS 6
-#define SYM_CATS 7
-#define SYM_NUM 8
-#define OCON_ISID 0
-#define OCON_FS 1
-#define OCON_PORT 2
-#define OCON_NETIF 3
-#define OCON_NODE 4
-#define OCON_FSUSE 5
-#define OCON_NODE6 6
-#define OCON_IBPKEY 7
-#define OCON_IBENDPORT 8
-#define OCON_NUM 9
-
-struct policydb
-{
-    int mls_enabled;
-    int android_netlink_route;
-    int android_netlink_getneigh;
-    struct symtab symtab[SYM_NUM];
-    struct flex_array *sym_val_to_name[SYM_NUM];
-    struct class_datum **class_val_to_struct;
-    struct role_datum **role_val_to_struct;
-    struct user_datum **user_val_to_struct;
-    struct flex_array *type_val_to_struct_array;
-    struct avtab te_avtab;
-    struct role_trans *role_tr;
-    struct ebitmap filename_trans_ttypes;
-    struct hashtab *filename_trans;
-    struct cond_bool_datum **bool_val_to_struct;
-    struct avtab te_cond_avtab;
-    struct cond_node *cond_list;
-    struct role_allow *role_allow;
-    struct ocontext *ocontexts[OCON_NUM];
-    struct genfs *genfs;
-    struct hashtab *range_tr;
-    struct flex_array *type_attr_map_array;
-    struct ebitmap policycaps;
-    struct ebitmap permissive_map;
-    size_t len;
-    unsigned int policyvers;
-    unsigned int reject_unknown : 1;
-    unsigned int allow_unknown : 1;
-    u16 process_class;
-    u32 process_trans_perms;
-};
-
-/* sidtab entry (only the leading fields are used: sid + context). */
-struct sidtab_entry
-{
-    u32 sid;
-    struct context context;
-    struct hlist_node hash;
-    struct sidtab_entry *next;
-};
+#include <selinux_ss.h>
 
 /* ---- vmalloc with the GKI *_noprof fallback ---- */
 
@@ -474,26 +143,39 @@ static policydb_read_fn kp_policydb_read;
 static policydb_load_isids_fn kp_policydb_load_isids;
 static policydb_destroy_fn kp_policydb_destroy;
 
-/* 6.4+ ss/ internals used by the *_with_policy wrappers. */
+/* ss/ internals used by the *_with_policy wrappers. */
 typedef int (*string_to_context_struct_fn)(struct policydb *pol, void *sidtab, char *scontext,
                                            struct context *ctx, u32 def_sid);
+/* 4.14/4.19 pass the explicit context length, 5.0 dropped it -- the same
+ * boundary as selinux_hide_is_new_version(). */
+typedef int (*string_to_context_struct_6_fn)(struct policydb *pol, void *sidtab, char *scontext,
+                                             u32 scontext_len, struct context *ctx, u32 def_sid);
 typedef int (*sidtab_context_to_sid_fn)(void *s, struct context *context, u32 *out_sid);
 typedef struct sidtab_entry *(*sidtab_search_entry_fn)(void *s, u32 sid);
+/* 4.9 - 5.9 return the context directly; 5.10+ replaced this with
+ * sidtab_search_entry(). */
+typedef struct context *(*sidtab_search_fn)(void *s, u32 sid);
 typedef int (*sidtab_sid2str_get_fn)(void *s, struct sidtab_entry *entry, char **out, u32 *out_len);
 typedef void (*sidtab_sid2str_put_fn)(void *s, struct sidtab_entry *entry, char *str, u32 str_len);
 typedef int (*context_struct_to_string_fn)(struct policydb *p, struct context *context, char **scontext,
                                            u32 *scontext_len);
+/* 4.9 / 4.14 (pre-selinux_state) take no policydb: the helper resolves symbols
+ * through the global policy database. */
+typedef int (*context_struct_to_string_3_fn)(struct context *context, char **scontext, u32 *scontext_len);
 typedef struct sidtab_entry *(*sidtab_search_core_fn)(void *s, u32 sid, int force);
 typedef void (*context_struct_compute_av_fn)(struct policydb *policydb, struct context *scontext,
                                              struct context *tcontext, u16 tclass, struct av_decision *avd,
                                              struct extended_perms *xperms);
 
 static string_to_context_struct_fn kp_string_to_context_struct;
+static string_to_context_struct_6_fn kp_string_to_context_struct_6;
 static sidtab_context_to_sid_fn kp_sidtab_context_to_sid;
 static sidtab_search_entry_fn kp_sidtab_search_entry;
+static sidtab_search_fn kp_sidtab_search;
 static sidtab_sid2str_get_fn kp_sidtab_sid2str_get;
 static sidtab_sid2str_put_fn kp_sidtab_sid2str_put;
 static context_struct_to_string_fn kp_context_struct_to_string;
+static context_struct_to_string_3_fn kp_context_struct_to_string_3;
 static sidtab_search_core_fn kp_sidtab_search_core;
 static context_struct_compute_av_fn kp_context_struct_compute_av;
 
@@ -513,8 +195,32 @@ static void *kp_backup_sidtab(void);
 int selinux_sepolicy_snapshot(void);
 static int kp_context_to_sid_with_policy(const char *scontext, u32 scontext_len, u32 *out_sid, u32 def_sid,
                                          gfp_t gfp);
+static int kp_string_to_context_into(struct policydb *policydb, void *sidtab, const char *scontext,
+                                     u32 scontext_len, gfp_t gfp, struct context *out);
+static struct context *kp_sidtab_context(void *sidtab, u32 sid, struct sidtab_entry **out_entry);
 static int kp_sid_to_context_with_policy(u32 sid, char **scontext, u32 *scontext_len);
 static void kp_compute_av_user_with_policy(u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);
+
+/*
+ * The 4.9 - 4.18 backend brings its own evaluators.  On those kernels
+ * context_struct_compute_av() and context_struct_to_string() bind the global
+ * policydb instead of taking it as an argument (upstream 4.9/4.14), so they
+ * cannot be pointed at the deep copy.  The legacy backend therefore computes
+ * the decision and renders the context itself from the copy, and registers the
+ * two entry points here; until it does, the query helpers stay -ENOSYS and the
+ * feature refuses to enable.
+ */
+static void (*kp_legacy_compute_av)(void *pdb, struct context *scontext, struct context *tcontext,
+                                    u16 tclass, struct av_decision *avd);
+static int (*kp_legacy_to_string)(void *pdb, struct context *ctx, char **out, u32 *out_len);
+
+void selinux_sepolicy_register_legacy_impl(void (*av)(void *, struct context *, struct context *, u16,
+                                                      struct av_decision *),
+                                           int (*to_string)(void *, struct context *, char **, u32 *))
+{
+    kp_legacy_compute_av = av;
+    kp_legacy_to_string = to_string;
+}
 
 #define KP_CLEAN_EVAL_SLOTS 8
 
@@ -580,10 +286,32 @@ void selinux_sepolicy_clean_eval_leave(void)
     kp_clean_eval_leave();
 }
 
+static bool g_policydb_redirect_disabled;
+static bool g_policydb_redirect_mismatch_warned;
+
 static void before_context_struct_compute_av(hook_fargs6_t *a, void *u)
 {
+    void *clean;
+
+    /* A 4.14 tree can export selinux_state without backporting the policydb
+     * argument to context_struct_compute_av(): there arg0 is scontext and arg3
+     * is the avd pointer.  Swapping arg0 in that case would hand the kernel a
+     * struct context where it expects a policydb, so detect the 5-argument form
+     * on the first call and never touch arg0 again.  tclass is u16, so arg3
+     * stays below 0x10000; any kernel pointer sets the high 32 bits. */
+    if (a->arg3 >> 32) {
+        if (!g_policydb_redirect_mismatch_warned) {
+            g_policydb_redirect_mismatch_warned = true;
+            logkfw("selinux_hide: context_struct_compute_av is 5-argument on this kernel "
+                   "(kver %x), policydb redirect disabled\n", kver);
+        }
+        g_policydb_redirect_disabled = true;
+        return;
+    }
+    if (g_policydb_redirect_disabled) return;
+
     if (!kp_clean_eval_active() || !g_backup_ready) return;
-    void *clean = kp_backup_policydb();
+    clean = kp_backup_policydb();
     if (!is_bad_address(clean)) {
         if (selinux_hide_query_log_level() >= 2)
             logkfi("query redirect compute_av: policydb %llx -> %llx\n", a->arg0, (unsigned long)clean);
@@ -591,8 +319,10 @@ static void before_context_struct_compute_av(hook_fargs6_t *a, void *u)
     }
 }
 
-/* string_to_context_struct(policydb, sidtab, scontext, ctx, def_sid): same
- * redirect so contextExists probes resolve against the clean snapshot. */
+/* string_to_context_struct: 4.14/4.19 take
+ * (policydb, sidtab, scontext, scontext_len, ctx, def_sid), 5.0+ dropped the
+ * length argument.  Only arg0 (the policydb) is rewritten, so capturing five
+ * registers is enough on both forms. */
 static void before_string_to_context_struct(hook_fargs5_t *a, void *u)
 {
     if (kp_clean_eval_active() && g_backup_ready) {
@@ -695,9 +425,16 @@ static security_read_policy_compat_fn kp_security_read_policy_compat;
 static unsigned long kp_sepolicy_state_addr;
 static bool kp_sepolicy_read_logged;
 
+/* Whether the ss/ helpers take a struct selinux_state argument -- one rule,
+ * shared with the 4.9 - 4.18 backend (see selinux_hide_ss_takes_state). */
+static bool kp_selinux_state_arg_required(void)
+{
+    return selinux_hide_ss_takes_state();
+}
+
 static int kp_sepolicy_read(void **data, size_t *len)
 {
-    bool without_state = selinux_hide_is_without_sepolicy_state_version();
+    bool without_state = !kp_selinux_state_arg_required();
 
     if (!kfunc(security_read_policy)) {
         kfunc(security_read_policy) = (typeof(kfunc(security_read_policy)))lookup_name_with_suffix(
@@ -721,6 +458,64 @@ static int kp_sepolicy_read(void **data, size_t *len)
     if (!kp_security_read_policy_compat)
         kp_security_read_policy_compat = (security_read_policy_compat_fn)(uintptr_t)kfunc(security_read_policy);
     return kp_security_read_policy_compat((void *)kp_sepolicy_state_addr, data, len);
+}
+
+/* Best effort serialization outside the load path (the post-fs-data snapshot).
+ *
+ * 6.6 and 6.12 document that security_read_policy() must be called with
+ * selinux_state.policy_mutex held: the read walks state->policy, which a
+ * manager's reload can replace right around post-fs-data (one device shows the
+ * reload at 4.588s and the snapshot at 4.542s).  The offset comes from BTF and
+ * the mutex helpers from kallsyms, so pre-BTF kernels simply keep the unlocked
+ * read and log it once instead of failing the snapshot. */
+typedef void (*kp_mutex_op_fn)(void *);
+
+static kp_mutex_op_fn kp_policy_mutex_lock;
+static kp_mutex_op_fn kp_policy_mutex_unlock;
+static long kp_policy_mutex_off = -2;
+static bool kp_policy_mutex_warned;
+
+static void *kp_policy_mutex(void)
+{
+    unsigned long state;
+
+    if (kp_policy_mutex_off == -2) {
+        kp_policy_mutex_off = kp_btf_member_offset("selinux_state", "policy_mutex");
+        kp_policy_mutex_lock = (kp_mutex_op_fn)lookup_name_with_suffix("mutex_lock");
+        kp_policy_mutex_unlock = (kp_mutex_op_fn)lookup_name_with_suffix("mutex_unlock");
+    }
+    if (kp_policy_mutex_off < 0 || kp_policy_mutex_off > 512 || (kp_policy_mutex_off & 7)) return NULL;
+    if (!kp_policy_mutex_lock || !kp_policy_mutex_unlock) return NULL;
+    state = lookup_name_with_suffix("selinux_state");
+    if (!state) return NULL;
+    return (void *)(state + (unsigned long)kp_policy_mutex_off);
+}
+
+static int kp_sepolicy_read_locked(void **data, size_t *len)
+{
+    void *m;
+    int rc;
+
+    /* Only 6.6+ requires (and documents) the external policy_mutex: there
+     * security_read_policy() only walks state->policy, so a concurrent reload is
+     * only excluded by that mutex.  4.9 protects the read with policy_rwlock and
+     * 4.19 - 6.5 with their own rwsem, so taking the mutex there would just add a
+     * lock-order risk for nothing. */
+    if (kver < KP_SELINUX_WITHOUT_SEPOLICY_STATE_VERSION) return kp_sepolicy_read(data, len);
+
+    m = kp_policy_mutex();
+    if (!m) {
+        if (!kp_policy_mutex_warned) {
+            kp_policy_mutex_warned = true;
+            logkfw("selinux_sepolicy: policy_mutex not resolvable, reading the live policy "
+                   "unlocked\n");
+        }
+        return kp_sepolicy_read(data, len);
+    }
+    kp_policy_mutex_lock(m);
+    rc = kp_sepolicy_read(data, len);
+    kp_policy_mutex_unlock(m);
+    return rc;
 }
 
 /* ---- policy-load capture ----
@@ -749,7 +544,9 @@ static bool kp_blob_looks_valid(const void *blob, size_t len)
 {
     u32 magic = 0;
 
-    if (!blob || len < 4096 || len > (16u << 20)) return false;
+    /* 512 is the floor: a hand-built policy for a test kernel can be ~2 KB, and
+     * anything smaller cannot carry the header policydb_read wants anyway. */
+    if (!blob || len < 512 || len > (16u << 20)) return false;
     lib_memcpy(&magic, blob, sizeof(magic));
     return magic == KP_POLICYDB_MAGIC;
 }
@@ -781,15 +578,17 @@ static void kp_capture_policy_load(uint64_t ret)
 
     /* Never read the hooked function's arguments: security_load_policy's ABI
      * differs across versions and LTO can fold it (on 6.12-android16 arg0 is
-     * not the blob pointer, and dereferencing it oopsed).  Serialize whatever
-     * is active now instead -- right after a successful load that is exactly
-     * the policy that was just installed. */
-    rc = kp_sepolicy_read(&data, &len);
+     * not the blob pointer, and dereferencing it oopsed).  Serialize whatever is
+     * live now instead: this runs from the selinuxfs write handler's after-hook,
+     * i.e. after the commit and after policy_mutex was released, so "live" is
+     * exactly the policy that was just loaded. */
+    rc = kp_sepolicy_read_locked(&data, &len);
     if (rc == -ENOENT) return;
-    if (rc || !data || !len) {
-        if (data && kfunc(kvfree)) kfunc(kvfree)(data);
+    if (rc) {
+        log_boot("selinux_sepolicy: policy read after load failed rc=%d, nothing captured\n", rc);
         return;
     }
+    if (!data || !len) return;
     if (!kp_blob_looks_valid(data, len)) {
         logkfw("selinux_sepolicy: serialized policy rejected (len %zu), ignoring this load\n", len);
         if (kfunc(kvfree)) kfunc(kvfree)(data);
@@ -814,43 +613,95 @@ static void kp_capture_policy_load(uint64_t ret)
     if (kfunc(kvfree)) kfunc(kvfree)(data);
 }
 
-/* >= 6.4: only the return value is used, see above. */
-static void after_security_load_policy_3(hook_fargs3_t *a, void *u)
+/* Build-time self test: a kpimg built with -DKP_SELINUX_HIDE_SELFTEST drives the
+ * feature right after a policy is installed -- the same sequence a manager's
+ * post-fs-data event runs on a device, at the moment the live policy is exactly
+ * the one we snapshot.  Release builds compile this to nothing. */
+static void kp_selftest_after_load(uint64_t ret)
 {
-    kp_capture_policy_load(a->ret);
+#ifdef KP_SELINUX_HIDE_SELFTEST
+    static bool ran;
+
+    if ((int)ret || ran) return;
+    ran = true;
+    selinux_hide_selftest_on_policy_load();
+#else
+    (void)ret;
+#endif
 }
 
-/* < 6.4: same, ABI differences cannot hurt us. */
-static void after_security_load_policy_4(hook_fargs4_t *a, void *u)
+/* Runs after the selinuxfs write handler returned: by then
+ * security_load_policy() has staged, selinux_policy_commit() has installed and
+ * policy_mutex has been released, so this is the first point where the new
+ * policy can be read without sitting in a critical section. */
+static void after_sel_write_load(hook_fargs4_t *a, void *u)
 {
-    kp_capture_policy_load(a->ret);
+    if ((long)a->ret <= 0) return;
+    kp_capture_policy_load(0);
+    kp_selftest_after_load(0);
 }
+
+/*
+ * Policy capture hangs off the selinuxfs write handler, NOT off
+ * security_load_policy.
+ *
+ *   sel_write_load()
+ *       mutex_lock(&selinux_state.policy_mutex)
+ *       security_load_policy(data, count, &load_state)   // 6.6+: stages only
+ *       selinux_policy_commit(&load_state)               // 6.6+: installs
+ *       mutex_unlock(&selinux_state.policy_mutex)
+ *
+ * An after-hook on security_load_policy therefore ran with policy_mutex held
+ * and, on 6.6+, before the commit: the first load saw a NULL state->policy and
+ * every later load re-read the PREVIOUS epoch, so 4.19+ never got the clean
+ * blob the snapshot is supposed to answer from -- while the whole 2 MB
+ * serialize/scan/copy happened inside the boot path's critical section.
+ *
+ * The after-hook on sel_write_load runs once the handler returns: commit done,
+ * mutex released.  One serialization there is both correct and outside every
+ * lock, and it covers 4.19 - 6.5 (security_load_policy installs it itself) and
+ * 4.9 - 4.18 (security_read_policy takes policy_rwlock on its own) unchanged.
+ */
+#define KP_SELINUX_CAPTURE_ON_LOAD 1
 
 static bool g_load_hook_installed;
 
-/* Idempotent: installed from the boot-time init so the platform policy loads
- * (first and second stage init) are seen; the post-fs-data init calls it too
- * in case the boot-time call could not resolve the symbol yet. */
+/* Idempotent: called from the boot-time init and again after the ss/ symbols
+ * resolved at post-fs-data. */
 static void kp_install_load_hook(void)
 {
     unsigned long addr;
 
     if (g_load_hook_installed || !selinux_sepolicy_supported()) return;
-    addr = lookup_name_with_suffix("security_load_policy");
-    if (!addr) return;
-    if (selinux_hide_is_without_sepolicy_state_version())
-        hook_wrap3((void *)addr, NULL, after_security_load_policy_3, NULL);
-    else
-        hook_wrap4((void *)addr, NULL, after_security_load_policy_4, NULL);
+    if (!KP_SELINUX_CAPTURE_ON_LOAD) {
+        g_load_hook_installed = true;
+        log_boot("selinux_sepolicy: policy capture disabled\n");
+        return;
+    }
+    /* sel_write_load() is the handler; sel_write() is its dispatcher and is
+     * used as a fallback when LTO folded the static helper into it. */
+    addr = lookup_name_with_suffix("sel_write_load");
+    if (!addr) addr = lookup_name_with_suffix("sel_write");
+    if (!addr) {
+        g_load_hook_installed = true;
+        logkfw("selinux_sepolicy: sel_write_load not found, the clean policy will not be "
+               "captured\n");
+        return;
+    }
+    hook_wrap4((void *)addr, NULL, after_sel_write_load, NULL);
     g_load_hook_installed = true;
-    log_boot("selinux_sepolicy: hooked security_load_policy @ %llx\n", addr);
+    log_boot("selinux_sepolicy: hooked sel_write_load @ %llx (capture after commit)\n", addr);
 }
 
 /* Called as early as possible (before_rest_init): the policy is loaded by
  * userspace init shortly after, so the capture hook must already be in place. */
 int selinux_sepolicy_boot_init(void)
 {
-    if (!selinux_sepolicy_supported()) return -EOPNOTSUPP;
+    if (!selinux_sepolicy_supported()) {
+        log_boot("selinux_sepolicy: built-in backend not used (kver %x, legacy %d)\n",
+                 kver, selinux_hide_legacy_required());
+        return -EOPNOTSUPP;
+    }
     kp_install_load_hook();
     return 0;
 }
@@ -890,7 +741,10 @@ static void kp_probe_snapshot_domains(void)
     int hits = 0;
 
     if (!g_backup_ready) return;
-    kp_probe_one("u:r:su:s0", &hits);
+    /* u:r:su:s0 is NOT a manager artifact: AOSP ships a su domain in the stock
+     * policy and it resolves on a clean device, so probing it only produced a
+     * false "already dirty" verdict on every real phone.  Only domains that
+     * exist exclusively after a manager patched the policy count here. */
     kp_probe_one("u:r:ksu:s0", &hits);
     kp_probe_one("u:r:magisk:s0", &hits);
     kp_probe_one("u:r:lsposed:s0", &hits);
@@ -928,7 +782,7 @@ static int kp_dup_sepolicy(void)
         len = g_clean_blob_len;
         log_boot("selinux_sepolicy: using the captured clean policy blob (%zu bytes)\n", len);
     } else {
-        rc = kp_sepolicy_read(&data, &len);
+        rc = kp_sepolicy_read_locked(&data, &len);
         if (rc || !data || !len) {
             log_boot("selinux_sepolicy: security_read_policy failed rc=%d\n", rc);
             if (data && kfunc(kvfree)) kfunc(kvfree)(data);
@@ -1012,6 +866,14 @@ bool selinux_sepolicy_backup_ready(void)
     return g_backup_ready;
 }
 
+const void *selinux_sepolicy_clean_blob(size_t *len)
+{
+    if (len) *len = 0;
+    if (!g_clean_blob || !g_clean_blob_len || !g_clean_locked) return NULL;
+    if (len) *len = g_clean_blob_len;
+    return g_clean_blob;
+}
+
 /* ---- query helpers against the deep copy ---- */
 
 static struct policydb *kp_backup_policydb(void)
@@ -1026,7 +888,83 @@ static void *kp_backup_sidtab(void)
     return *(void **)g_backup_policy;
 }
 
+/* ---- accessors for the legacy evaluator (selinux_hide_legacy.c) ---- */
+
+/* kmalloc for strings handed back to callers that free with kp_kernel_str_free
+ * (kfree); NULL when only vmalloc would work, because the two cannot be mixed. */
+void *selinux_sepolicy_kmalloc(unsigned long size)
+{
+    bool via_vmalloc = false;
+    void *p = kp_payload_alloc(size, KP_GFP_KERNEL, &via_vmalloc);
+
+    if (via_vmalloc) {
+        kp_payload_free(p, true);
+        return NULL;
+    }
+    return p;
+}
+
+void *selinux_sepolicy_policydb(void)
+{
+    return kp_backup_policydb();
+}
+
+void *selinux_sepolicy_sidtab(void)
+{
+    return kp_backup_sidtab();
+}
+
+/* Clean context of a SID, for the backend that has to evaluate the decision
+ * itself.  NULL when the copy has no such SID. */
+struct context *selinux_sepolicy_sid_context(u32 sid)
+{
+    void *sidtab = kp_backup_sidtab();
+
+    if (!g_backup_ready || !sidtab) return NULL;
+    return kp_sidtab_context(sidtab, sid, NULL);
+}
+
+/* Parse a context string against the copy (no live-policy side effects). */
+int selinux_sepolicy_parse_context(const char *scontext, u32 scontext_len, struct context *out)
+{
+    struct policydb *policydb = kp_backup_policydb();
+    void *sidtab = kp_backup_sidtab();
+
+    if (!g_backup_ready || !policydb || !sidtab || !out) return -ENOSYS;
+    return kp_string_to_context_into(policydb, sidtab, scontext, scontext_len, KP_GFP_KERNEL, out);
+}
+
 /* ---- query helpers against the backup policy ---- */
+
+/* Parse one context string against the copy's policydb/sidtab.  Shared by the
+ * SID path and the legacy evaluator (which parses without registering). */
+static int kp_string_to_context_into(struct policydb *policydb, void *sidtab, const char *scontext,
+                                     u32 scontext_len, gfp_t gfp, struct context *out)
+{
+    char *scontext2;
+    bool via_vmalloc = false;
+    int rc;
+
+    if (!policydb || !sidtab || !scontext_len || !out) return -EINVAL;
+    if (selinux_hide_is_new_version() ? !kp_string_to_context_struct
+                                      : !kp_string_to_context_struct_6)
+        return -ENOSYS;
+    if (scontext_len >= KP_CONTEXT_PAYLOAD_LIMIT) return -EINVAL;
+
+    scontext2 = kp_payload_alloc(scontext_len + 1, gfp, &via_vmalloc);
+    if (!scontext2) return -ENOMEM;
+    lib_memcpy(scontext2, scontext, scontext_len);
+    scontext2[scontext_len] = '\0';
+
+    lib_memset(out, 0, sizeof(*out));
+    if (selinux_hide_is_new_version())
+        rc = kp_string_to_context_struct(policydb, sidtab, scontext2, out, SECSID_NULL);
+    else
+        rc = kp_string_to_context_struct_6(policydb, sidtab, scontext2, scontext_len, out,
+                                           SECSID_NULL);
+    kp_payload_free(scontext2, via_vmalloc);
+    return rc;
+}
 
 static int kp_context_to_sid_with_policy(const char *scontext, u32 scontext_len, u32 *out_sid, u32 def_sid,
                                          gfp_t gfp)
@@ -1036,53 +974,87 @@ static int kp_context_to_sid_with_policy(const char *scontext, u32 scontext_len,
     struct context context;
     int rc;
 
+    (void)def_sid;
     if (!policydb || !sidtab || !scontext_len) return -EINVAL;
-    if (!kp_string_to_context_struct || !kp_sidtab_context_to_sid) return -ENOSYS;
+    if (!kp_sidtab_context_to_sid) return -ENOSYS;
 
-    char *scontext2;
-    bool via_vmalloc = false;
-
-    if (scontext_len >= KP_CONTEXT_PAYLOAD_LIMIT) return -EINVAL;
-    scontext2 = kp_payload_alloc(scontext_len + 1, gfp, &via_vmalloc);
-    if (!scontext2) return -ENOMEM;
-    lib_memcpy(scontext2, scontext, scontext_len);
-    scontext2[scontext_len] = '\0';
-
-    rc = kp_string_to_context_struct(policydb, sidtab, scontext2, &context, def_sid);
-    if (!rc)
-        rc = kp_sidtab_context_to_sid(sidtab, &context, out_sid);
-    kp_payload_free(scontext2, via_vmalloc);
-    return rc;
+    rc = kp_string_to_context_into(policydb, sidtab, scontext, scontext_len, gfp, &context);
+    if (rc) return rc;
+    return kp_sidtab_context_to_sid(sidtab, &context, out_sid);
 }
 
-static struct sidtab_entry *kp_sidtab_lookup(void *sidtab, u32 sid)
+/* sid -> context through whichever accessor this kernel has: entry-based on
+ * 5.10+, context-returning on 4.9 - 5.9.  *out_entry is the sidtab entry when
+ * the accessor returns one (needed by the sid2str cache), NULL otherwise. */
+static struct context *kp_sidtab_context(void *sidtab, u32 sid, struct sidtab_entry **out_entry)
 {
-    if (kp_sidtab_search_entry) return kp_sidtab_search_entry(sidtab, sid);
-    if (kp_sidtab_search_core) return kp_sidtab_search_core(sidtab, sid, 0);
+    struct sidtab_entry *entry;
+
+    if (out_entry) *out_entry = NULL;
+    if (kp_sidtab_search_entry) {
+        entry = kp_sidtab_search_entry(sidtab, sid);
+        if (!entry) return NULL;
+        if (out_entry) *out_entry = entry;
+        return &entry->context;
+    }
+    /* 4.9 - 5.9: sidtab_search() already returns the context, and so does the
+     * same-generation sidtab_search_core().  Prefer sidtab_search(): the core
+     * variant was reshaped to return an entry by 5.10, where
+     * sidtab_search_entry() above takes over anyway. */
+    if (kp_sidtab_search) return kp_sidtab_search(sidtab, sid);
+    if (kp_sidtab_search_core) {
+        entry = kp_sidtab_search_core(sidtab, sid, 0);
+        if (!entry) return NULL;
+        if (out_entry) *out_entry = entry;
+        return &entry->context;
+    }
     return NULL;
+}
+
+/* context_struct_to_string() gained the policydb argument in 4.17 and kept it
+ * when 6.6 dropped selinux_state from the ss/ helpers: 4.9 - 4.16 is the
+ * 3-argument form, 4.17+ is (policydb, context, out, len) on every version
+ * including 6.6/6.12.  This is a policydb question, not the state question --
+ * keying it off ss_takes_state() sent 6.6+ into the 3-argument call with a
+ * struct context in the policydb slot. */
+static bool kp_to_string_takes_policydb(void)
+{
+    return kver >= VERSION(4, 17, 0);
 }
 
 static int kp_sid_to_context_with_policy(u32 sid, char **scontext, u32 *scontext_len)
 {
     struct policydb *policydb = kp_backup_policydb();
     void *sidtab = kp_backup_sidtab();
-    struct sidtab_entry *entry;
+    struct sidtab_entry *entry = NULL;
+    struct context *ctx;
     int rc;
 
     if (scontext) *scontext = NULL;
     *scontext_len = 0;
     if (!policydb || !sidtab) return -EINVAL;
 
-    entry = kp_sidtab_lookup(sidtab, sid);
-    if (!entry) return -EINVAL;
+    ctx = kp_sidtab_context(sidtab, sid, &entry);
+    if (!ctx) return -EINVAL;
 
-    if (kp_sidtab_sid2str_get) {
+    if (kp_legacy_to_string) {
+        /* Legacy kernels render with the global policydb; the registered
+         * renderer names the copy's symbols instead. */
+        return kp_legacy_to_string(policydb, ctx, scontext, scontext_len);
+    }
+
+    if (kp_sidtab_sid2str_get && entry) {
         rc = kp_sidtab_sid2str_get(sidtab, entry, scontext, scontext_len);
         if (rc != -ENOENT) return rc;
     }
-    if (!kp_context_struct_to_string) return -EINVAL;
-    rc = kp_context_struct_to_string(policydb, &entry->context, scontext, scontext_len);
-    if (!rc && scontext && kp_sidtab_sid2str_put)
+    if (kp_to_string_takes_policydb()) {
+        if (!kp_context_struct_to_string) return -EINVAL;
+        rc = kp_context_struct_to_string(policydb, ctx, scontext, scontext_len);
+    } else {
+        if (!kp_context_struct_to_string_3) return -EINVAL;
+        rc = kp_context_struct_to_string_3(ctx, scontext, scontext_len);
+    }
+    if (!rc && scontext && kp_sidtab_sid2str_put && entry)
         kp_sidtab_sid2str_put(sidtab, entry, *scontext, *scontext_len);
     return rc;
 }
@@ -1091,11 +1063,19 @@ static void kp_compute_av_user_with_policy(u32 ssid, u32 tsid, u16 tclass, struc
 {
     struct policydb *policydb = kp_backup_policydb();
     void *sidtab = kp_backup_sidtab();
-    struct sidtab_entry *se, *te;
     struct context *scontext, *tcontext;
 
-    if (!policydb || !sidtab || !kp_context_struct_compute_av) return;
-    if (!kp_sidtab_search_entry && !kp_sidtab_search_core) return;
+    if (!policydb || !sidtab) return;
+    if (kp_legacy_compute_av) {
+        scontext = kp_sidtab_context(sidtab, ssid, NULL);
+        if (!scontext) return;
+        tcontext = kp_sidtab_context(sidtab, tsid, NULL);
+        if (!tcontext) return;
+        kp_legacy_compute_av(policydb, scontext, tcontext, tclass, avd);
+        return;
+    }
+    if (!kp_context_struct_compute_av) return;
+    if (!kp_sidtab_search && !kp_sidtab_search_entry && !kp_sidtab_search_core) return;
 
     avd->allowed = 0;
     avd->auditallow = 0;
@@ -1103,13 +1083,11 @@ static void kp_compute_av_user_with_policy(u32 ssid, u32 tsid, u16 tclass, struc
     avd->seqno = KP_AVD_CLEAN_SEQNO;
     avd->flags = 0;
 
-    se = kp_sidtab_lookup(sidtab, ssid);
-    if (!se) return;
-    scontext = &se->context;
+    scontext = kp_sidtab_context(sidtab, ssid, NULL);
+    if (!scontext) return;
 
-    te = kp_sidtab_lookup(sidtab, tsid);
-    if (!te) return;
-    tcontext = &te->context;
+    tcontext = kp_sidtab_context(sidtab, tsid, NULL);
+    if (!tcontext) return;
 
     if (unlikely(!tclass)) {
         if (g_backup_allow_unknown) avd->allowed = 0xffffffff;
@@ -1150,6 +1128,21 @@ void selinux_sepolicy_compute_av_user(u32 ssid, u32 tsid, u16 tclass, struct av_
     kp_compute_av_user_with_policy(ssid, tsid, tclass, avd);
 }
 
+/*
+ * Status page counters are per-kernel-version, because the page only exists
+ * after somebody opens it and selinux_status_update_policyload() drops updates
+ * while selinux_state.status_page is still NULL (status.c: the page is
+ * allocated on first open with sequence=0 / policyload=0).
+ *
+ *   <= 6.6 : the boot load is over before the page exists, so a clean device
+ *            reads 0/0 -- "legacy initial status counters".
+ *   >= 6.7 : the page exists by the time the boot load commits, so a clean
+ *            device reads sequence=4 / policyload=1.
+ *
+ * Do NOT report the 6.7+ values on an older kernel: a 6.6 device that claims
+ * sequence=4 says its status page was already live during the boot load, which
+ * only happens on newer kernels -- DirtySepolicy flags exactly that mismatch.
+ */
 static bool kp_clean_status_modern(void)
 {
     return kver >= VERSION(6, 7, 0);
@@ -1178,7 +1171,7 @@ int selinux_sepolicy_init(void)
     unsigned long addr;
 
     if (!selinux_sepolicy_supported()) {
-        log_boot("selinux_sepolicy: requires kernel >= 4.19 (kver %x)\n", kver);
+        log_boot("selinux_sepolicy: requires kernel >= 4.9 (kver %x)\n", kver);
         return -EOPNOTSUPP;
     }
 
@@ -1191,15 +1184,20 @@ int selinux_sepolicy_init(void)
     kp_policydb_destroy = (policydb_destroy_fn)lookup_name_with_suffix("policydb_destroy");
 
     kp_string_to_context_struct = (string_to_context_struct_fn)lookup_name_with_suffix("string_to_context_struct");
+    kp_string_to_context_struct_6 =
+        (string_to_context_struct_6_fn)lookup_name_with_suffix("string_to_context_struct");
     kp_sidtab_context_to_sid = (sidtab_context_to_sid_fn)lookup_name_with_suffix("sidtab_context_to_sid");
     kp_sidtab_search_entry = (sidtab_search_entry_fn)lookup_name_with_suffix("sidtab_search_entry");
+    kp_sidtab_search = (sidtab_search_fn)lookup_name_with_suffix("sidtab_search");
     kp_sidtab_sid2str_get = (sidtab_sid2str_get_fn)lookup_name_with_suffix("sidtab_sid2str_get");
     kp_sidtab_sid2str_put = (sidtab_sid2str_put_fn)lookup_name_with_suffix("sidtab_sid2str_put");
     kp_context_struct_to_string = (context_struct_to_string_fn)lookup_name_with_suffix("context_struct_to_string");
+    kp_context_struct_to_string_3 =
+        (context_struct_to_string_3_fn)lookup_name_with_suffix("context_struct_to_string");
     kp_sidtab_search_core = (sidtab_search_core_fn)lookup_name_with_suffix("sidtab_search_core");
     kp_context_struct_compute_av = (context_struct_compute_av_fn)lookup_name_with_suffix("context_struct_compute_av");
     kp_payload_resolve();
-    if (!selinux_hide_is_new_version()) {
+    if (!selinux_hide_is_new_version() && !selinux_hide_legacy_required()) {
         /* Only the argument-redirect hooks are needed: the deep copy is consumed by
         * swapping the policydb argument while an app query runs. */
         addr = lookup_name_with_suffix("context_struct_compute_av");
@@ -1216,16 +1214,8 @@ int selinux_sepolicy_init(void)
 
     /* Capture policy blobs as they are loaded, so the clean copy comes from the
      * full platform policy and not from an earlier (or later, patched) epoch.
-     * ABI: >= 6.4 (data, len, load_state); before that
-     * (state, data, len, load_state). */
-    addr = lookup_name_with_suffix("security_load_policy");
-    if (addr) {
-        if (selinux_hide_is_without_sepolicy_state_version())
-            hook_wrap3((void *)addr, NULL, after_security_load_policy_3, NULL);
-        else
-            hook_wrap4((void *)addr, NULL, after_security_load_policy_4, NULL);
-        log_boot("selinux_sepolicy: hooked security_load_policy @ %llx\n", addr);
-    }
+     * Idempotent: the boot-time init usually got here first. */
+    kp_install_load_hook();
 
     log_boot("selinux_sepolicy: read=%llx str2ctx=%llx sidtab2sid=%llx search=%llx\n",
              (unsigned long)kfunc(security_read_policy), (unsigned long)kp_string_to_context_struct,
