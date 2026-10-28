@@ -487,6 +487,7 @@ typedef struct sidtab_entry *(*sidtab_search_core_fn)(void *s, u32 sid, int forc
 typedef void (*context_struct_compute_av_fn)(struct policydb *policydb, struct context *scontext,
                                              struct context *tcontext, u16 tclass, struct av_decision *avd,
                                              struct extended_perms *xperms);
+typedef void (*context_destroy_fn)(struct context *context);
 
 static string_to_context_struct_fn kp_string_to_context_struct;
 static sidtab_context_to_sid_fn kp_sidtab_context_to_sid;
@@ -496,6 +497,7 @@ static sidtab_sid2str_put_fn kp_sidtab_sid2str_put;
 static context_struct_to_string_fn kp_context_struct_to_string;
 static sidtab_search_core_fn kp_sidtab_search_core;
 static context_struct_compute_av_fn kp_context_struct_compute_av;
+static context_destroy_fn kp_context_destroy;
 
 /* ---- state ---- */
 
@@ -1049,8 +1051,13 @@ static int kp_context_to_sid_with_policy(const char *scontext, u32 scontext_len,
     scontext2[scontext_len] = '\0';
 
     rc = kp_string_to_context_struct(policydb, sidtab, scontext2, &context, def_sid);
-    if (!rc)
+    if (!rc) {
         rc = kp_sidtab_context_to_sid(sidtab, &context, out_sid);
+        /* The sidtab entry keeps its own copy; the local one still owns the MLS
+         * range bitmaps, which stock releases the same way in
+         * security_context_to_sid_core(). */
+        if (kp_context_destroy) kp_context_destroy(&context);
+    }
     kp_payload_free(scontext2, via_vmalloc);
     return rc;
 }
@@ -1151,8 +1158,10 @@ int selinux_sepolicy_context_to_sid_inplace(char *scontext, u32 scontext_len, u3
     if (scontext[scontext_len] != '\0') return -EINVAL;
 
     rc = kp_string_to_context_struct(policydb, sidtab, scontext, &context, SECSID_NULL);
-    if (!rc)
+    if (!rc) {
         rc = kp_sidtab_context_to_sid(sidtab, &context, out_sid);
+        if (kp_context_destroy) kp_context_destroy(&context);
+    }
     return rc;
 }
 
@@ -1212,6 +1221,7 @@ int selinux_sepolicy_init(void)
     kp_context_struct_to_string = (context_struct_to_string_fn)lookup_name_with_suffix("context_struct_to_string");
     kp_sidtab_search_core = (sidtab_search_core_fn)lookup_name_with_suffix("sidtab_search_core");
     kp_context_struct_compute_av = (context_struct_compute_av_fn)lookup_name_with_suffix("context_struct_compute_av");
+    kp_context_destroy = (context_destroy_fn)lookup_name_with_suffix("context_destroy");
     kp_payload_resolve();
     if (!selinux_hide_is_new_version()) {
         /* Only the argument-redirect hooks are needed: the deep copy is consumed by
