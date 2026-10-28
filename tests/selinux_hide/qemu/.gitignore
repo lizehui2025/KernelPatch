@@ -1,0 +1,9 @@
+init
+initramfs.cpio.gz
+clean.blob
+policy.blob
+boot-*.log
+sectime2
+attrprobe
+__pycache__/
+*.pyc
