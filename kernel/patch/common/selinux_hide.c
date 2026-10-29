@@ -190,44 +190,67 @@ int selinux_hide_query_log_level(void)
 
 static unsigned long kp_selinux_state_addr;
 
-/* Status page replacement: point selinux_state.status_page at a page the
- * kernel allocates itself (KernelSU-style consistency).  read/mmap then stay
- * stock and app/root read the same counters.  If the factory is unavailable or
- * fails, the real page is restored and the status surface stays stock. */
+/* Status page: hand the kernel a page of our own through
+ * selinux_kernel_status_page() instead of rewriting selinux_state.status_page.
+ * The state stores a `struct page *` and page_address() is an inline on arm64,
+ * so the counters of a page we did not allocate cannot be written portably;
+ * the factory is the one place where a page pointer can be swapped without
+ * depending on the struct page layout.  read and mmap then stay on the stock
+ * path, and the counters are the ones a device that loaded its policy once
+ * publishes (4/1 from 6.10 on, the creation sentinel below). */
 typedef void *(*status_page_fn)(void *state);
+typedef void *(*vmalloc_to_page_fn)(const void *addr);
 static status_page_fn kp_status_page_fn;
-static long g_status_page_off = -2;
-static void *g_real_status_page;
-static void *g_fake_status_page;
+static vmalloc_to_page_fn kp_vmalloc_to_page;
+static void *g_fake_status_page;      /* struct page * handed to the kernel */
+static bool g_status_hooked;
+
+static u32 kp_live_enforcing(void);
+static void fill_fake_status_bytes(void);
+static void init_fake_status(void);
+
+static void before_status_factory(hook_fargs2_t *a, void *u)
+{
+    if (!g_fake_status_page) return;
+    a->ret = (uint64_t)(uintptr_t)g_fake_status_page;
+    a->skip_origin = 1;
+}
 
 static int kp_status_install(void)
 {
-    unsigned long state = kp_selinux_state_addr;
     void *page;
 
-    if (!state || !kp_status_page_fn) return -EAGAIN;
-    if (g_status_page_off == -2) {
-        long off = kp_btf_member_offset("selinux_state", "status_page");
-        g_status_page_off = (off >= 0 && off < 240) ? off : -1;
-    }
-    if (g_status_page_off < 0 || g_fake_status_page) return -EAGAIN;
+    if (g_status_hooked) return 0;
+    if (!kp_status_page_fn || !kp_vmalloc_to_page) return -EAGAIN;
 
-    g_real_status_page = *(void **)(state + (unsigned long)g_status_page_off);
-    *(void **)(state + (unsigned long)g_status_page_off) = NULL;
+    fill_fake_status_bytes();
+    init_fake_status();
+    if (!fake_status_vaddr) return -EAGAIN;
 
-    /* 6.6+ takes no argument and ignores the register; 4.17 - 6.5 take state. */
-    page = kp_status_page_fn((void *)state);
-
+    page = kp_vmalloc_to_page(fake_status_vaddr);
     if (!page) {
-        *(void **)(state + (unsigned long)g_status_page_off) = g_real_status_page;
-        logkfw("selinux_hide: status page replacement failed, real page restored\n");
+        logkfw("selinux_hide: vmalloc_to_page unavailable, status stays stock\n");
+        return -EAGAIN;
+    }
+
+    if (hook_wrap2((void *)kp_status_page_fn, before_status_factory, NULL, NULL) != HOOK_NO_ERR) {
+        logkfw("selinux_hide: status factory hook failed, status stays stock\n");
         return -EAGAIN;
     }
 
     g_fake_status_page = page;
-    log_boot("selinux_hide: status page replaced (real %px, fake %px)\n",
-             g_real_status_page, page);
+    g_status_hooked = true;
+    log_boot("selinux_hide: status page served from a clean page (seq=%u policyload=%u)\n",
+             selinux_sepolicy_clean_seq(), selinux_sepolicy_clean_policyload());
     return 0;
+}
+
+static void kp_status_uninstall(void)
+{
+    if (!g_status_hooked) return;
+    hook_unwrap((void *)kp_status_page_fn, (void *)before_status_factory, NULL);
+    g_status_hooked = false;
+    g_fake_status_page = NULL;
 }
 
 static u32 kp_live_enforcing(void)
@@ -1221,6 +1244,7 @@ static unsigned long kp_fops_mmap_index(long llseek)
 
 void selinux_hide_uninstall_all_hooks(void)
 {
+    kp_status_uninstall();
     for (int i = g_hooked_cnt - 1; i >= 0; i--) {
         if (g_hooked[i]) unhook((void *)g_hooked[i]);
         g_hooked[i] = 0;
@@ -1328,12 +1352,6 @@ static int selinux_hide_install_hooks(void)
         if (rc) goto err;
     }
 
-    /* status: the kernel owns the page; only the pointer is swapped.  A
-     * failure here is non-fatal -- read/mmap stay stock on the real page. */
-    if (kp_status_install() != 0) {
-        logkfw("selinux_hide: status stays stock (page replacement unavailable)\n");
-    }
-
     /* /sys/fs/selinux/policy: overwrite the stock open buffer with the clean
      * blob and zero the tail, keeping the live length.  read/mmap then stay
      * stock, stat and read always agree, and no per-open size rewrite is
@@ -1376,6 +1394,12 @@ static int selinux_hide_install_hooks(void)
                    "hiding the transaction nodes only\n",
                    g_wrapped_policy_open, have_blob, KP_SELINUX_HIDE_PARTIAL_FILE);
         }
+    }
+
+    /* Status last: a refused enable must not leave the status surface
+     * replaced while every other hook is missing. */
+    if (kp_status_install() != 0) {
+        logkfw("selinux_hide: status stays stock (status page unavailable)\n");
     }
 
     logkfi("selinux_hide: hooks ready (context=%d access=%d status_read=%d status_mmap=%d "
@@ -1654,6 +1678,7 @@ void selinux_hide_resolve_symbols(void)
             (security_task_getsecid_fn)lookup_name_with_suffix("security_task_getsecid");
     kp_selinux_state_addr = lookup_name_with_suffix("selinux_state");
     kp_status_page_fn = (status_page_fn)lookup_name_with_suffix("selinux_kernel_status_page");
+    kp_vmalloc_to_page = (vmalloc_to_page_fn)lookup_name_with_suffix("vmalloc_to_page");
 
     sel_write_context_addr = lookup_name_with_suffix("sel_write_context");
     sel_write_access_addr = lookup_name_with_suffix("sel_write_access");
