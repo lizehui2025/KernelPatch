@@ -143,6 +143,28 @@ static policydb_read_fn kp_policydb_read;
 static policydb_load_isids_fn kp_policydb_load_isids;
 static policydb_destroy_fn kp_policydb_destroy;
 
+/* Destroying the local struct context after sidtab_context_to_sid() is what the
+ * stock security_context_to_sid_core() does: the parser allocates one ebitmap
+ * node per MLS level (range.level[0/1].cat) and the sidtab keeps its own copy.
+ * context_destroy() itself is a static inline in 4.9 - 6.14 (single argument,
+ * no policydb), so there is no unambiguous symbol to call -- and this kernel
+ * carries two out-of-line copies of it.  Use the one global helper it calls
+ * instead; ebitmap_destroy() is exported in every version and is NULL-safe. */
+typedef void (*ebitmap_destroy_fn)(struct ebitmap *e);
+static ebitmap_destroy_fn kp_ebitmap_destroy;
+
+static void kp_context_destroy(struct context *c)
+{
+    if (!c) return;
+    if (kp_ebitmap_destroy) {
+        kp_ebitmap_destroy(&c->range.level[0].cat);
+        kp_ebitmap_destroy(&c->range.level[1].cat);
+    }
+    /* Only set on the force/def_sid path, which the query wrappers never take. */
+    if (c->str) kp_kernel_str_free(c->str);
+    lib_memset(c, 0, sizeof(*c));
+}
+
 /* ss/ internals used by the *_with_policy wrappers. */
 typedef int (*string_to_context_struct_fn)(struct policydb *pol, void *sidtab, char *scontext,
                                            struct context *ctx, u32 def_sid);
@@ -287,6 +309,12 @@ void selinux_sepolicy_clean_eval_leave(void)
 }
 
 static bool g_policydb_redirect_disabled;
+static bool g_policydb_redirect_active;
+
+bool selinux_sepolicy_redirect_active(void)
+{
+    return g_policydb_redirect_active && !g_policydb_redirect_disabled;
+}
 static bool g_policydb_redirect_mismatch_warned;
 
 static void before_context_struct_compute_av(hook_fargs6_t *a, void *u)
@@ -613,6 +641,49 @@ static void kp_capture_policy_load(uint64_t ret)
     if (kfunc(kvfree)) kfunc(kvfree)(data);
 }
 
+/* ---- live policy probe (diagnostic) ----
+ *
+ * Serializes whatever the live policy is right now and counts the same markers
+ * the detectors look for, so dmesg answers "is this moment clean?" without
+ * changing anything else: nothing is captured, cached or enabled here.
+ *
+ * Called at post-fs-data before/after, after every policy load and on the
+ * first app-side query, so a boot log shows whether the boot policy was
+ * already patched and when it went dirty.  Read-only with respect to the
+ * feature: it allocates the serialized copy and frees it again.
+ */
+void selinux_sepolicy_probe_live(const char *tag)
+{
+    void *data = NULL;
+    size_t len = 0;
+    int rc, magisk, ksu, apatch, supolicy, lsposed, droidspaces, xposed;
+
+    if (!selinux_sepolicy_supported()) return;
+
+    rc = kp_sepolicy_read_locked(&data, &len);
+    if (rc || !data || !len) {
+        log_boot("selinux_hide: PROBE live[%s] read failed rc=%d\n", tag ? tag : "?", rc);
+        if (data && kfunc(kvfree)) kfunc(kvfree)(data);
+        return;
+    }
+
+    magisk = kp_blob_count(data, len, "magisk");
+    ksu = kp_blob_count(data, len, "ksu");
+    apatch = kp_blob_count(data, len, "apatch");
+    supolicy = kp_blob_count(data, len, "supolicy");
+    lsposed = kp_blob_count(data, len, "lsposed");
+    droidspaces = kp_blob_count(data, len, "droidspaces");
+    xposed = kp_blob_count(data, len, "xposed");
+
+    log_boot("selinux_hide: PROBE live[%s] len=%zu clean=%d magisk=%d ksu=%d apatch=%d "
+             "supolicy=%d lsposed=%d droidspaces=%d xposed=%d\n",
+             tag ? tag : "?", len,
+             (magisk | ksu | apatch | supolicy | lsposed | droidspaces | xposed) ? 0 : 1,
+             magisk, ksu, apatch, supolicy, lsposed, droidspaces, xposed);
+
+    if (kfunc(kvfree)) kfunc(kvfree)(data);
+}
+
 /* Build-time self test: a kpimg built with -DKP_SELINUX_HIDE_SELFTEST drives the
  * feature right after a policy is installed -- the same sequence a manager's
  * post-fs-data event runs on a device, at the moment the live policy is exactly
@@ -636,9 +707,18 @@ static void kp_selftest_after_load(uint64_t ret)
  * policy can be read without sitting in a critical section. */
 static void after_sel_write_load(hook_fargs4_t *a, void *u)
 {
+    static int probed_live;
+
     if ((long)a->ret <= 0) return;
     kp_capture_policy_load(0);
     kp_selftest_after_load(0);
+    /* Diagnostic: one probe per load shows exactly which load introduced the
+     * markers.  Bounded so a manager that reloads in a loop cannot flood the
+     * log. */
+    if (probed_live < 6) {
+        probed_live++;
+        selinux_sepolicy_probe_live("load");
+    }
 }
 
 /*
@@ -768,6 +848,7 @@ static int kp_dup_sepolicy(void)
     void *sidtab;
     size_t len = 0;
     bool owned = false;
+    bool live_clean = false;
     int rc;
 
     if (!kfunc(security_read_policy) || !kp_policydb_read || !kp_policydb_load_isids) {
@@ -796,7 +877,8 @@ static int kp_dup_sepolicy(void)
         owned = true;
         /* No load was captured: this is whatever policy is live now, so report
          * whether it is still free of root markers. */
-        log_boot("selinux_sepolicy: live blob scan (len %zu), clean=%d\n", len, kp_blob_is_clean(data, len));
+        live_clean = kp_blob_is_clean(data, len);
+        log_boot("selinux_sepolicy: live blob scan (len %zu), clean=%d\n", len, live_clean);
     }
 
     /* policydb_read()/policydb_load_isids() require zero-initialized targets
@@ -843,6 +925,21 @@ static int kp_dup_sepolicy(void)
     log_boot("selinux_sepolicy: deep copy ready (blob len %zu, allow_unknown %d, pdb %llx, sidtab %llx)\n",
              len, g_backup_allow_unknown, (unsigned long)pdb, (unsigned long)sidtab);
     kp_probe_snapshot_domains();
+
+    /* The load-capture path only stores a blob when it observes a marker-free
+     * load.  On devices whose manager patches the policy before/at the first
+     * observed load that never happens, and /sys/fs/selinux/policy would then
+     * stay live while the transaction nodes answer from this snapshot -- the
+     * self-contradiction the feature exists to avoid.  Adopt the clean policy
+     * this snapshot was built from. */
+    if (owned && live_clean && !g_clean_blob) {
+        g_clean_blob = data;
+        g_clean_blob_len = len;
+        g_clean_locked = true;
+        owned = false;
+        log_boot("selinux_sepolicy: adopted the clean live policy as the served blob (%zu bytes)\n", len);
+    }
+
     rc = 0;
     goto out;
 
@@ -979,8 +1076,16 @@ static int kp_context_to_sid_with_policy(const char *scontext, u32 scontext_len,
     if (!kp_sidtab_context_to_sid) return -ENOSYS;
 
     rc = kp_string_to_context_into(policydb, sidtab, scontext, scontext_len, gfp, &context);
+    /* On failure the in-kernel parser has already destroyed the partial context
+     * (string_to_context_struct() does so on every error path). */
     if (rc) return rc;
-    return kp_sidtab_context_to_sid(sidtab, &context, out_sid);
+
+    rc = kp_sidtab_context_to_sid(sidtab, &context, out_sid);
+    /* The sidtab keeps its own copy; the MLS range allocated while parsing is
+     * ours and only this call releases it.  Without it every accepted query
+     * leaks two ebitmap nodes (128 B) that nothing reclaims. */
+    kp_context_destroy(&context);
+    return rc;
 }
 
 /* sid -> context through whichever accessor this kernel has: entry-based on
@@ -1129,28 +1234,65 @@ void selinux_sepolicy_compute_av_user(u32 ssid, u32 tsid, u16 tclass, struct av_
 }
 
 /*
- * Status page counters are per-kernel-version, because the page only exists
- * after somebody opens it and selinux_status_update_policyload() drops updates
- * while selinux_state.status_page is still NULL (status.c: the page is
- * allocated on first open with sequence=0 / policyload=0).
+ * The status page is not a function of the kernel version.  It is allocated on
+ * the first open, initialised to sequence=0 / policyload=0, and both
+ * selinux_status_update_policyload() and selinux_status_update_setenforce()
+ * bump sequence by 2 -- and drop the update entirely while
+ * selinux_state.status_page is still NULL.
  *
- *   <= 6.6 : the boot load is over before the page exists, so a clean device
- *            reads 0/0 -- "legacy initial status counters".
- *   >= 6.7 : the page exists by the time the boot load commits, so a clean
- *            device reads sequence=4 / policyload=1.
+ * The only local fact that maps to a clean timeline is therefore whether the
+ * page exists by the time the fake page is built (post-fs-data, i.e. after the
+ * boot policy load):
  *
- * Do NOT report the 6.7+ values on an older kernel: a 6.6 device that claims
- * sequence=4 says its status page was already live during the boot load, which
- * only happens on newer kernels -- DirtySepolicy flags exactly that mismatch.
+ *   page present : a clean device saw the boot load, so it reads 4/1 -- or
+ *                  2/1 when still permissive, where no enforce bump happened.
+ *   page absent  : a clean device saw no load either, so it reads 0/0.
+ *                  Claiming 4/1 here would invent a load the page never saw.
+ *   unknown      : no BTF / no struct selinux_state (pre-4.17); stay at 0/0,
+ *                  which is what those kernels produce without the
+ *                  pre-allocation patch.
+ *
+ * A device with extra reloads (the live page reads e.g. 14/8) still gets the
+ * clean answer: that is the disguise.  Unlike a version constant it never
+ * claims a timeline the page cannot have, and a 6.6 kernel that opened the
+ * page early is handled correctly.
  */
+static unsigned long kp_status_state_addr(void)
+{
+    static unsigned long addr;
+
+    if (!addr) addr = lookup_name_with_suffix("selinux_state");
+    return addr;
+}
+
+/* The status page is pre-allocated by init_sel_fs() only from 6.10 on (the
+ * "(void) selinux_kernel_status_page()" call at the end of init_sel_fs); 6.6 -
+ * 6.9 create it on the first open, which on a clean device happens after the
+ * boot policy load, so their counters start and stay at 0/0.  A 6.6 device can
+ * still show a live status page when some process opens it early, but
+ * reporting 4/1 there claims a timeline the kernel cannot produce: the page
+ * did not exist when the boot load committed.  Keep the version floor and
+ * report the modern counters only from 6.10 on (2/1 while still permissive,
+ * where the enforce switch never bumped sequence). */
 static bool kp_clean_status_modern(void)
 {
-    return kver >= VERSION(6, 7, 0);
+    return kver >= VERSION(6, 10, 0);
+}
+
+static u32 kp_status_enforcing(void)
+{
+    static long off = -2;
+    unsigned long addr = kp_status_state_addr();
+
+    if (off == -2) off = kp_btf_member_offset("selinux_state", "enforcing");
+    if (!addr || off < 0 || off > 240) return 1;
+    return *(volatile u8 *)(addr + (unsigned long)off) ? 1 : 0;
 }
 
 u32 selinux_sepolicy_clean_seq(void)
 {
-    return kp_clean_status_modern() ? KP_CLEAN_STATUS_SEQUENCE : 0;
+    if (!kp_clean_status_modern()) return 0;
+    return kp_status_enforcing() ? KP_CLEAN_STATUS_SEQUENCE : 2;
 }
 
 u32 selinux_sepolicy_clean_policyload(void)
@@ -1168,7 +1310,15 @@ int selinux_sepolicy_clean_deny_unknown(void)
 
 int selinux_sepolicy_init(void)
 {
+    static bool done;
     unsigned long addr;
+
+    /* selinux_sepolicy_boot_init() installs the load hook first; this one runs
+     * at post-fs-data and resolves the rest.  Guard the whole body so the
+     * argument-redirect hooks below (4.9 - 4.19) can never be installed twice
+     * if the init entry point is ever reached again. */
+    if (done) return 0;
+    done = true;
 
     if (!selinux_sepolicy_supported()) {
         log_boot("selinux_sepolicy: requires kernel >= 4.9 (kver %x)\n", kver);
@@ -1182,6 +1332,9 @@ int selinux_sepolicy_init(void)
     kp_policydb_read = (policydb_read_fn)lookup_name_with_suffix("policydb_read");
     kp_policydb_load_isids = (policydb_load_isids_fn)lookup_name_with_suffix("policydb_load_isids");
     kp_policydb_destroy = (policydb_destroy_fn)lookup_name_with_suffix("policydb_destroy");
+    kp_ebitmap_destroy = (ebitmap_destroy_fn)lookup_name_with_suffix("ebitmap_destroy");
+    if (!kp_ebitmap_destroy)
+        logkfw("selinux_sepolicy: ebitmap_destroy unresolved, parsed MLS contexts will leak\n");
 
     kp_string_to_context_struct = (string_to_context_struct_fn)lookup_name_with_suffix("string_to_context_struct");
     kp_string_to_context_struct_6 =
@@ -1197,7 +1350,7 @@ int selinux_sepolicy_init(void)
     kp_sidtab_search_core = (sidtab_search_core_fn)lookup_name_with_suffix("sidtab_search_core");
     kp_context_struct_compute_av = (context_struct_compute_av_fn)lookup_name_with_suffix("context_struct_compute_av");
     kp_payload_resolve();
-    if (!selinux_hide_is_new_version() && !selinux_hide_legacy_required()) {
+    if (!selinux_hide_legacy_required()) {
         /* Only the argument-redirect hooks are needed: the deep copy is consumed by
         * swapping the policydb argument while an app query runs. */
         addr = lookup_name_with_suffix("context_struct_compute_av");
@@ -1210,6 +1363,7 @@ int selinux_sepolicy_init(void)
             hook_wrap5((void *)addr, before_string_to_context_struct, NULL, NULL);
             log_boot("selinux_sepolicy: hooked string_to_context_struct @ %llx\n", addr);
         }
+        g_policydb_redirect_active = true;
     }
 
     /* Capture policy blobs as they are loaded, so the clean copy comes from the

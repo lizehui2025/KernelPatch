@@ -48,6 +48,11 @@ bool selinux_sepolicy_backup_ready(void);
 
 bool selinux_sepolicy_snapshot_dirty(void);
 
+/* Diagnostic: serialize the live policy and log the root-manager markers it
+ * carries ("clean" = none).  Read-only; safe from post-fs-data, from the load
+ * hook and from a query path. */
+void selinux_sepolicy_probe_live(const char *tag);
+
 /*
  * Last serialized policy blob the load path captured before a root manager
  * patched the live policy, i.e. the same bytes the snapshot is built from.
@@ -62,6 +67,7 @@ bool selinux_sepolicy_snapshot_dirty(void);
  */
 const void *selinux_sepolicy_clean_blob(size_t *len);
 
+bool selinux_sepolicy_redirect_active(void);
 int selinux_sepolicy_clean_eval_enter(void);
 void selinux_sepolicy_clean_eval_leave(void);
 
@@ -71,9 +77,13 @@ int selinux_sepolicy_sid_to_context(u32 sid, char **scontext, u32 *scontext_len)
 int selinux_sepolicy_context_str_to_sid(const char *scontext, u32 *out_sid, gfp_t gfp);
 void selinux_sepolicy_compute_av_user(u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);
 
-/* Stock counters: sequence is the even seqlock progress (4 once booted),
- * policyload is policy->latest_granting (1 for the boot load) and avd.seqno
- * follows policyload; pre-6.7 kernels leave the page at 0. */
+/* Stock counters for the clean baseline.  The status page is pre-allocated by
+ * init_sel_fs() only from 6.10 on; 6.6 - 6.9 create it on the first open,
+ * which a clean device reaches after the boot policy load, so their counters
+ * start and stay at 0/0.  6.10+ record the load and the enforce switch, i.e.
+ * 4/1 (2/1 while still permissive).  policyload is policy->latest_granting
+ * (1 for the boot load); avd.seqno is NOT status.policyload and stays 1 on
+ * every supporting kernel. */
 #define KP_CLEAN_STATUS_SEQUENCE 4
 #define KP_CLEAN_STATUS_POLICYLOAD 1
 
