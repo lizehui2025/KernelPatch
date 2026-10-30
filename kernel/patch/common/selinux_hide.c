@@ -1160,7 +1160,11 @@ static void after_sel_open_policy(hook_fargs2_t *a, void *udata)
     /* struct policy_load_memory { size_t len; void *data; } -- len first. */
     *(size_t *)plm = len;
     *(void **)((char *)plm + sizeof(size_t)) = copy;
-    kp_vfree(old);
+    /* old comes from the stock security_read_policy(): 4.19 kmallocs it on
+     * small policies, 6.x uses kvzalloc, so vfree() alone would free the wrong
+     * way.  kvfree() handles both. */
+    if (kfunc(kvfree)) kfunc(kvfree)(old);
+    else kp_vfree(old);
     logkfi("selinux_hide: policy open: serving clean blob (%zu bytes, copied)\n", len);
 }
 

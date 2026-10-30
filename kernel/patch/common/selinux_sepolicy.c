@@ -632,7 +632,12 @@ static void kp_capture_policy_load(uint64_t ret)
         copy = kp_vmalloc(len);
         if (copy) {
             lib_memcpy(copy, data, len);
-            if (g_clean_blob) kp_vfree(g_clean_blob);
+            if (g_clean_blob) {
+                /* adopted blobs come from security_read_policy() (kvzalloc on
+                 * 6.x), captured ones from kp_vmalloc(); kvfree() matches both */
+                if (kfunc(kvfree)) kfunc(kvfree)(g_clean_blob);
+                else kp_vfree(g_clean_blob);
+            }
             g_clean_blob = copy;
             g_clean_blob_len = len;
             log_boot("selinux_sepolicy: captured clean policy blob from a load (len %zu)\n", len);
@@ -922,6 +927,7 @@ static int kp_dup_sepolicy(void)
     rc = kp_policydb_read(pdb, &fp);
     if (rc) {
         log_boot("selinux_sepolicy: policydb_read failed rc=%d\n", rc);
+        if (kp_policydb_destroy) kp_policydb_destroy(pdb);
         goto out_free;
     }
 
