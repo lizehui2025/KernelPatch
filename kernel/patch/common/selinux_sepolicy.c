@@ -223,27 +223,6 @@ static struct context *kp_sidtab_context(void *sidtab, u32 sid, struct sidtab_en
 static int kp_sid_to_context_with_policy(u32 sid, char **scontext, u32 *scontext_len);
 static void kp_compute_av_user_with_policy(u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);
 
-/*
- * The 4.9 - 4.18 backend brings its own evaluators.  On those kernels
- * context_struct_compute_av() and context_struct_to_string() bind the global
- * policydb instead of taking it as an argument (upstream 4.9/4.14), so they
- * cannot be pointed at the deep copy.  The legacy backend therefore computes
- * the decision and renders the context itself from the copy, and registers the
- * two entry points here; until it does, the query helpers stay -ENOSYS and the
- * feature refuses to enable.
- */
-static void (*kp_legacy_compute_av)(void *pdb, struct context *scontext, struct context *tcontext,
-                                    u16 tclass, struct av_decision *avd);
-static int (*kp_legacy_to_string)(void *pdb, struct context *ctx, char **out, u32 *out_len);
-
-void selinux_sepolicy_register_legacy_impl(void (*av)(void *, struct context *, struct context *, u16,
-                                                      struct av_decision *),
-                                           int (*to_string)(void *, struct context *, char **, u32 *))
-{
-    kp_legacy_compute_av = av;
-    kp_legacy_to_string = to_string;
-}
-
 #define KP_CLEAN_EVAL_SLOTS 8
 
 static struct {
@@ -778,8 +757,7 @@ static void kp_install_load_hook(void)
 int selinux_sepolicy_boot_init(void)
 {
     if (!selinux_sepolicy_supported()) {
-        log_boot("selinux_sepolicy: built-in backend not used (kver %x, legacy %d)\n",
-                 kver, selinux_hide_legacy_required());
+        log_boot("selinux_sepolicy: built-in backend not used (kver %x)\n", kver);
         return -EOPNOTSUPP;
     }
     kp_install_load_hook();
@@ -1007,56 +985,9 @@ static void *kp_backup_sidtab(void)
     return *(void **)g_backup_policy;
 }
 
-/* ---- accessors for the legacy evaluator (selinux_hide_legacy.c) ---- */
-
-/* kmalloc for strings handed back to callers that free with kp_kernel_str_free
- * (kfree); NULL when only vmalloc would work, because the two cannot be mixed. */
-void *selinux_sepolicy_kmalloc(unsigned long size)
-{
-    bool via_vmalloc = false;
-    void *p = kp_payload_alloc(size, KP_GFP_KERNEL, &via_vmalloc);
-
-    if (via_vmalloc) {
-        kp_payload_free(p, true);
-        return NULL;
-    }
-    return p;
-}
-
-void *selinux_sepolicy_policydb(void)
-{
-    return kp_backup_policydb();
-}
-
-void *selinux_sepolicy_sidtab(void)
-{
-    return kp_backup_sidtab();
-}
-
-/* Clean context of a SID, for the backend that has to evaluate the decision
- * itself.  NULL when the copy has no such SID. */
-struct context *selinux_sepolicy_sid_context(u32 sid)
-{
-    void *sidtab = kp_backup_sidtab();
-
-    if (!g_backup_ready || !sidtab) return NULL;
-    return kp_sidtab_context(sidtab, sid, NULL);
-}
-
-/* Parse a context string against the copy (no live-policy side effects). */
-int selinux_sepolicy_parse_context(const char *scontext, u32 scontext_len, struct context *out)
-{
-    struct policydb *policydb = kp_backup_policydb();
-    void *sidtab = kp_backup_sidtab();
-
-    if (!g_backup_ready || !policydb || !sidtab || !out) return -ENOSYS;
-    return kp_string_to_context_into(policydb, sidtab, scontext, scontext_len, KP_GFP_KERNEL, out);
-}
-
 /* ---- query helpers against the backup policy ---- */
 
-/* Parse one context string against the copy's policydb/sidtab.  Shared by the
- * SID path and the legacy evaluator (which parses without registering). */
+/* Parse one context string against the copy's policydb/sidtab. */
 static int kp_string_to_context_into(struct policydb *policydb, void *sidtab, const char *scontext,
                                      u32 scontext_len, gfp_t gfp, struct context *out)
 {
@@ -1164,12 +1095,6 @@ static int kp_sid_to_context_with_policy(u32 sid, char **scontext, u32 *scontext
     ctx = kp_sidtab_context(sidtab, sid, &entry);
     if (!ctx) return -EINVAL;
 
-    if (kp_legacy_to_string) {
-        /* Legacy kernels render with the global policydb; the registered
-         * renderer names the copy's symbols instead. */
-        return kp_legacy_to_string(policydb, ctx, scontext, scontext_len);
-    }
-
     if (kp_sidtab_sid2str_get && entry) {
         rc = kp_sidtab_sid2str_get(sidtab, entry, scontext, scontext_len);
         if (rc != -ENOENT) return rc;
@@ -1193,14 +1118,6 @@ static void kp_compute_av_user_with_policy(u32 ssid, u32 tsid, u16 tclass, struc
     struct context *scontext, *tcontext;
 
     if (!policydb || !sidtab) return;
-    if (kp_legacy_compute_av) {
-        scontext = kp_sidtab_context(sidtab, ssid, NULL);
-        if (!scontext) return;
-        tcontext = kp_sidtab_context(sidtab, tsid, NULL);
-        if (!tcontext) return;
-        kp_legacy_compute_av(policydb, scontext, tcontext, tclass, avd);
-        return;
-    }
     if (!kp_context_struct_compute_av) return;
     if (!kp_sidtab_search && !kp_sidtab_search_entry && !kp_sidtab_search_core) return;
 
@@ -1372,21 +1289,19 @@ int selinux_sepolicy_init(void)
     kp_sidtab_search_core = (sidtab_search_core_fn)lookup_name_with_suffix("sidtab_search_core");
     kp_context_struct_compute_av = (context_struct_compute_av_fn)lookup_name_with_suffix("context_struct_compute_av");
     kp_payload_resolve();
-    if (!selinux_hide_legacy_required()) {
-        /* Only the argument-redirect hooks are needed: the deep copy is consumed by
-        * swapping the policydb argument while an app query runs. */
-        addr = lookup_name_with_suffix("context_struct_compute_av");
-        if (addr) {
-            hook_wrap6((void *)addr, before_context_struct_compute_av, NULL, NULL);
-            log_boot("selinux_sepolicy: hooked context_struct_compute_av @ %llx\n", addr);
-        }
-        addr = lookup_name_with_suffix("string_to_context_struct");
-        if (addr) {
-            hook_wrap5((void *)addr, before_string_to_context_struct, NULL, NULL);
-            log_boot("selinux_sepolicy: hooked string_to_context_struct @ %llx\n", addr);
-        }
-        g_policydb_redirect_active = true;
+    /* Only the argument-redirect hooks are needed: the deep copy is consumed by
+    * swapping the policydb argument while an app query runs. */
+    addr = lookup_name_with_suffix("context_struct_compute_av");
+    if (addr) {
+        hook_wrap6((void *)addr, before_context_struct_compute_av, NULL, NULL);
+        log_boot("selinux_sepolicy: hooked context_struct_compute_av @ %llx\n", addr);
     }
+    addr = lookup_name_with_suffix("string_to_context_struct");
+    if (addr) {
+        hook_wrap5((void *)addr, before_string_to_context_struct, NULL, NULL);
+        log_boot("selinux_sepolicy: hooked string_to_context_struct @ %llx\n", addr);
+    }
+    g_policydb_redirect_active = true;
 
     /* Capture policy blobs as they are loaded, so the clean copy comes from the
      * full platform policy and not from an earlier (or later, patched) epoch.

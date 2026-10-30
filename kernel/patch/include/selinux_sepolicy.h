@@ -104,31 +104,4 @@ int selinux_sepolicy_clean_deny_unknown(void);
 /* The queries above compute entirely against the deep copy (KernelSU style);
  * no redirect scope is needed or provided any more. */
 
-/* ---- entry points for the 4.9 - 4.18 legacy evaluator ---- */
-
-/* Raw access to the deep copy.  Both return NULL until the snapshot exists. */
-void *selinux_sepolicy_policydb(void);
-void *selinux_sepolicy_sidtab(void);
-
-/* kmalloc for strings returned to callers that free with kp_kernel_str_free. */
-void *selinux_sepolicy_kmalloc(unsigned long size);
-
-/* Context of a SID in the copy (NULL when unknown). */
-struct context *selinux_sepolicy_sid_context(u32 sid);
-
-/* Parse a context string against the copy; no live-policy side effects. */
-int selinux_sepolicy_parse_context(const char *scontext, u32 scontext_len, struct context *out);
-
-/*
- * Legacy kernels (4.9 - 4.18 without the policydb-argument ss/ helpers) cannot
- * evaluate or render through the kernel's own functions, because those bind the
- * global policydb.  The legacy backend registers its own evaluators here:
- *   av        -- compute a decision for two contexts in the copy
- *   to_string -- render a context of the copy back to a string
- * Once registered, every query helper above routes through them.
- */
-void selinux_sepolicy_register_legacy_impl(void (*av)(void *, struct context *, struct context *, u16,
-                                                      struct av_decision *),
-                                           int (*to_string)(void *, struct context *, char **, u32 *));
-
 #endif
