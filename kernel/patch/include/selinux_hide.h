@@ -8,13 +8,12 @@
 
 #include <common.h>
 
-/* Lowest kernel this feature accepts: 4.9.  Kernels below 4.19 are served by
- * the legacy backend in selinux_hide_legacy.c -- no selinux_state, a
- * 5-argument context_struct_compute_av() and a 3-argument
- * context_struct_to_string() -- so the clean policy has to be evaluated
- * without the stateful helpers.  4.19+ keeps the existing main backend, and
- * the two backends never install hooks at the same time. */
-#define KP_SELINUX_HIDE_MIN_VERSION VERSION(4, 9, 0)
+/* Lowest kernel this feature accepts: 4.19.  The 4.9 - 4.18 compatibility
+ * backend is no longer shipped: those kernels keep the pre-refactor SELinux
+ * layout (no struct selinux_state, a 5-argument context_struct_compute_av(),
+ * a 2-argument security_read_policy()) and are refused with -EOPNOTSUPP
+ * instead of being served by a second, less tested evaluator. */
+#define KP_SELINUX_HIDE_MIN_VERSION VERSION(4, 19, 0)
 #define KP_SELINUX_MAIN_VERSION VERSION(4, 19, 0)
 #define KP_SELINUX_NEW_VERSION VERSION(5, 0, 0)
 #define KP_SELINUX_WITHOUT_SEPOLICY_STATE_VERSION VERSION(6, 6, 0)
@@ -44,11 +43,10 @@ int selinux_hide_state_abi_unverified(void);
  * every helper, because the backport moved them together. */
 static inline bool selinux_hide_ss_takes_state(void)
 {
+    /* 4.19 - 6.5: stateful helpers.  From 6.6 the policy lives in a
+     * struct selinux_policy and the helpers dropped the argument. */
     if (kver >= KP_SELINUX_WITHOUT_SEPOLICY_STATE_VERSION) return false;
-    /* selinux_state itself landed in 4.19; 4.17 and 4.18 are upstream trees
-     * without it, so the version alone does not imply the stateful ABI. */
-    if (kver >= KP_SELINUX_MAIN_VERSION) return true;
-    return selinux_hide_runtime_has_state() != 0;
+    return true;
 }
 
 /* ---- legacy backend (4.9 - 4.18) ---- */
