@@ -364,6 +364,21 @@ static void before_string_to_context_struct(hook_fargs5_t *a, void *u)
     }
 }
 
+/* 4.19 still passes scontext_len: the argument list is (pol, sidtab, scontext,
+ * scontext_len, ctx, def_sid), so the wrapper has to keep all six slots. */
+static void before_string_to_context_struct_6(hook_fargs6_t *a, void *u)
+{
+    if (kp_clean_eval_active() && g_backup_ready) {
+        void *clean = kp_backup_policydb();
+        if (!is_bad_address(clean)) {
+            if (selinux_hide_query_log_level() >= 2)
+                logkfi("query redirect string_to_context_struct: policydb %llx -> %llx\n", a->arg0,
+                       (unsigned long)clean);
+            a->arg0 = (uint64_t)clean;
+        }
+    }
+}
+
 /* ---- KernelSU-style deep copy of the clean policy ----
  * Mirror of KernelSU's ksu_dup_sepolicy(): the copy is fully independent, so
  * every pointer it holds belongs to it (that is what makes it a deep copy --
@@ -1388,7 +1403,10 @@ int selinux_sepolicy_init(void)
         }
         addr = lookup_name_with_suffix("string_to_context_struct");
         if (addr) {
-            hook_wrap5((void *)addr, before_string_to_context_struct, NULL, NULL);
+            if (kver >= VERSION(5, 0, 0))
+                hook_wrap5((void *)addr, before_string_to_context_struct, NULL, NULL);
+            else
+                hook_wrap6((void *)addr, before_string_to_context_struct_6, NULL, NULL);
             log_boot("selinux_sepolicy: hooked string_to_context_struct @ %llx\n", addr);
         }
         g_policydb_redirect_active = true;
