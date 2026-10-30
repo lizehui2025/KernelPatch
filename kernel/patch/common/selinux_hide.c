@@ -1435,9 +1435,24 @@ err:
  */
 int selinux_hide_runtime_has_state(void)
 {
-    /* 4.19 introduced struct selinux_state and everything this feature still
-     * accepts has it, so the probe is a version check now. */
-    return selinux_hide_is_supported();
+    /* 0 = unanswered, 1 = stateful, -1 = BTF proved the plain ABI.  Only a
+     * positive kallsyms answer is cached as retryable, because ksyms may still
+     * be empty very early in boot. */
+    static int have_state;
+
+    if (have_state) return have_state > 0;
+
+    /* A backport that only adds the variable leaves security_read_policy()
+     * with two parameters; calling it with three corrupts the struct.  BTF
+     * answers that question directly, so it outranks the symbol. */
+    switch (kp_btf_func_args("security_read_policy")) {
+    case 3: have_state = 1; return 1;
+    case 2: have_state = -1; return 0;
+    default: break;
+    }
+
+    if (kvar(selinux_state) || lookup_name_with_suffix("selinux_state")) have_state = 1;
+    return have_state > 0;
 }
 
 /*
@@ -1454,10 +1469,19 @@ int selinux_hide_runtime_has_state(void)
  */
 int selinux_hide_state_abi_unverified(void)
 {
-    /* Pre-4.19 trees are refused outright (no legacy backend any more) and
-     * 4.19+ always ships the stateful ABI, so there is nothing left to
-     * guess about.  Kept so the call sites stay explicit. */
-    return 0;
+    struct file *f;
+    bool optin;
+
+    if (kver >= KP_SELINUX_MAIN_VERSION || !selinux_hide_is_supported()) return 0;
+    if (!selinux_hide_runtime_has_state()) return 0;
+    /* -1 here means BTF says 2-arg, which runtime_has_state() already turned
+     * into "no state".  Any non-negative answer settled the question. */
+    if (kp_btf_func_args("security_read_policy") >= 0) return 0;
+
+    f = filp_open(KP_SELINUX_HIDE_MAIN_FILE, KP_O_RDONLY, 0);
+    optin = !IS_ERR(f);
+    if (optin) filp_close(f, 0);
+    return !optin;
 }
 
 /*
@@ -1474,14 +1498,19 @@ int selinux_hide_state_abi_unverified(void)
  */
 int selinux_hide_main_path_supported(void)
 {
-    return selinux_hide_is_supported();
+    if (kver >= KP_SELINUX_MAIN_VERSION) return 1;
+    if (kver < KP_SELINUX_HIDE_MIN_VERSION) return 0;
+    if (selinux_hide_state_abi_unverified()) return 0;
+    return selinux_hide_runtime_has_state();
 }
 
 int selinux_hide_legacy_required(void)
 {
-    /* The compatibility backend is no longer shipped: a kernel below the floor
-     * is refused by selinux_hide_enable() instead. */
-    return 0;
+    if (!selinux_hide_is_supported()) return 0;
+    /* The legacy backend resolves the same ss/ helpers through the same
+     * 2- vs 3-argument rule, so an unverifiable ABI poisons it too. */
+    if (selinux_hide_state_abi_unverified()) return 0;
+    return !selinux_hide_main_path_supported();
 }
 
 int selinux_hide_enable(void)
@@ -1491,7 +1520,7 @@ int selinux_hide_enable(void)
         if (unlikely(android_is_safe_mode)) return -EPERM;
     #endif
     if (!selinux_hide_is_supported()) {
-        logkfw("selinux_hide: kernel %x below 4.19, feature not supported\n", kver);
+        logkfw("selinux_hide: kernel %x below 4.9, feature not supported\n", kver);
         return -EOPNOTSUPP;
     }
     if (selinux_hide_enabled) return 0;
@@ -1588,10 +1617,6 @@ int selinux_hide_post_fs_data(const char *args)
      * "after", once apd/Magisk have finished their policy reloads. */
     if (lib_strcmp(args, "before") == 0 || args[0] == '\0') {
         log_boot("selinux_hide: post-fs-data before\n");
-        if (!selinux_hide_is_supported()) {
-            logkfw("selinux_hide: kernel %x below 4.19, skipping the boot policy snapshot\n", kver);
-            return 0;
-        }
         log_boot("selinux_hide: btf security_read_policy args: %d, state ABI unverified: %d\n",
                  kp_btf_func_args("security_read_policy"), selinux_hide_state_abi_unverified());
         /* Diagnostic: is the boot policy still untouched at this point? */
