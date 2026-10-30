@@ -606,10 +606,10 @@ mls_ops:
  * skipped: it names types through the global policydb, and the decision itself
  * (masking the permissions that exceed the bound) is what callers see. */
 static void kp_type_bounds_av(struct context *scontext, struct context *tcontext, u16 tclass,
-                              struct av_decision *avd);
+                              struct av_decision *avd, int depth);
 
 static void kp_compute_av_in_policy(struct context *scontext, struct context *tcontext, u16 tclass,
-                                    struct av_decision *avd)
+                                    struct av_decision *avd, int depth)
 {
     struct class_datum *tclass_datum;
     struct constraint_node *constraint;
@@ -620,6 +620,7 @@ static void kp_compute_av_in_policy(struct context *scontext, struct context *tc
     struct ebitmap_node *snode, *tnode;
     unsigned int i, j;
     int hops = 0;
+    int nodes = 0;
 
     avd->allowed = 0;
     avd->auditallow = 0;
@@ -653,6 +654,9 @@ static void kp_compute_av_in_policy(struct context *scontext, struct context *tc
             avkey.target_type = (u16)(j + 1);
             for (node = kp_avtab_search_node(g_view.te_avtab, &avkey); node;
                  node = kp_avtab_search_node_next(node, avkey.specified)) {
+                /* A garbage avtab must not turn this into an un-preemptible
+                 * loop; the chain stays short in any real policy. */
+                if (++nodes > KP_EBIT_MAX_NODES * 16) break;
                 if (node->key.specified == AVTAB_ALLOWED)
                     avd->allowed |= node->datum.u.data;
                 else if (node->key.specified == AVTAB_AUDITALLOW)
@@ -687,12 +691,17 @@ static void kp_compute_av_in_policy(struct context *scontext, struct context *tc
         if (!ra) avd->allowed &= ~g_view.process_trans_perms;
     }
 
-    kp_type_bounds_av(scontext, tcontext, tclass, avd);
+    kp_type_bounds_av(scontext, tcontext, tclass, avd, depth);
 }
 
 static void kp_type_bounds_av(struct context *scontext, struct context *tcontext, u16 tclass,
-                              struct av_decision *avd)
+                              struct av_decision *avd, int depth)
 {
+    /* Bounds form a tree in a valid policy; a mis-probed one can point a type
+     * at itself, so stop after a couple of levels instead of recursing until
+     * the kernel stack is gone. */
+    if (depth >= 2) return;
+
     struct context lo_scontext;
     struct context lo_tcontext, *tcontextp = tcontext;
     struct av_decision lo_avd;
@@ -717,7 +726,7 @@ static void kp_type_bounds_av(struct context *scontext, struct context *tcontext
         tcontextp = &lo_tcontext;
     }
 
-    kp_compute_av_in_policy(&lo_scontext, tcontextp, tclass, &lo_avd);
+    kp_compute_av_in_policy(&lo_scontext, tcontextp, tclass, &lo_avd, depth + 1);
 
     masked = ~lo_avd.allowed & avd->allowed;
     if (!masked) return;
@@ -876,7 +885,7 @@ static void kp_legacy_av_impl(void *pdb, struct context *scontext, struct contex
     avd->seqno = KP_AVD_CLEAN_SEQNO;
     avd->flags = 0;
     if (!g_eval_ready || !scontext || !tcontext) return;
-    kp_compute_av_in_policy(scontext, tcontext, tclass, avd);
+    kp_compute_av_in_policy(scontext, tcontext, tclass, avd, 0);
 }
 
 static int kp_legacy_to_string_impl(void *pdb, struct context *ctx, char **out, u32 *out_len)
@@ -1047,7 +1056,7 @@ static unsigned int kp_selftest(void)
 
                 lib_memset(&ours, 0, sizeof(ours));
                 lib_memset(&live, 0, sizeof(live));
-                kp_compute_av_in_policy(sctx, tctx, (u16)tclass, &ours);
+                kp_compute_av_in_policy(sctx, tctx, (u16)tclass, &ours, 0);
                 if (compute_state)
                     compute_state((void *)state_addr, live_sid[a], live_sid[i], (u16)tclass, &live);
                 else
