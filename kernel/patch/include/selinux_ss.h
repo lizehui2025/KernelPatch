@@ -321,9 +321,10 @@ struct avtab
 #define OCON_IBENDPORT 8
 #define OCON_NUM 9
 
-/* Type declarations only: the policydb itself is written and read by the
- * kernel's own policydb_read()/policydb_load_isids(), which use the kernel's
- * layout.  Nothing here is dereferenced field by field. */
+/* Two layouts share one tail: Android trees insert
+ * android_netlink_route/android_netlink_getneigh right after mls_enabled, the
+ * upstream tree does not.  Which one a given kernel uses is probed at runtime
+ * (see selinux_hide_legacy.c), never assumed from the version. */
 #define KP_POLICYDB_TAIL \
     struct symtab symtab[SYM_NUM]; \
     struct flex_array *sym_val_to_name[SYM_NUM]; \
@@ -348,6 +349,13 @@ struct policydb
     int mls_enabled;
     int android_netlink_route;
     int android_netlink_getneigh;
+
+    KP_POLICYDB_TAIL
+};
+
+struct policydb_plain
+{
+    int mls_enabled;
 
     KP_POLICYDB_TAIL
 };

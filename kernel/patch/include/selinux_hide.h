@@ -23,9 +23,24 @@
  * layout is guaranteed.  Safe to call from boot-time init. */
 int selinux_hide_main_path_supported(void);
 
+/* True when this kernel (4.9 - 4.18) has to be served by the legacy backend. */
+int selinux_hide_legacy_required(void);
+
+/* Runtime probe for the selinux_state symbol: decides whether the ss/ helpers
+ * take a state argument on pre-4.17 kernels. */
+int selinux_hide_runtime_has_state(void);
+
+/* True when a pre-4.19 tree exports selinux_state but nothing can settle the
+ * security_read_policy() ABI: both backends would call the ss/ helpers with the
+ * wrong argument count, so neither is allowed to run.  BTF settles it, and the
+ * manager can force the stateful backend with /data/adb/ap/selinux_hide_main. */
+int selinux_hide_state_abi_unverified(void);
+
 /* Whether the ss/ helpers (avc_has_perm, security_read_policy,
  * context_struct_to_string, security_context_to_sid, ...) take a
- * struct selinux_state argument. */
+ * struct selinux_state argument: 4.17+ always, 6.6+ never, and 4.9 - 4.16
+ * depends on the vendor backport, so the symbol is probed there.  One rule for
+ * every helper, because the backport moved them together. */
 static inline bool selinux_hide_ss_takes_state(void)
 {
     /* 4.19 - 6.5: stateful helpers.  From 6.6 the policy lives in a
@@ -33,6 +48,12 @@ static inline bool selinux_hide_ss_takes_state(void)
     if (kver >= KP_SELINUX_WITHOUT_SEPOLICY_STATE_VERSION) return false;
     return true;
 }
+
+/* ---- legacy backend (4.9 - 4.18) ---- */
+int selinux_hide_legacy_init(void);
+int selinux_hide_legacy_enable(void);
+void selinux_hide_legacy_disable(void);
+int selinux_hide_legacy_is_enabled(void);
 
 /* Resolve every symbol the feature uses.  Idempotent; shared by both backends. */
 void selinux_hide_resolve_symbols(void);
