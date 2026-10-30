@@ -45,7 +45,9 @@ int selinux_hide_state_abi_unverified(void);
 static inline bool selinux_hide_ss_takes_state(void)
 {
     if (kver >= KP_SELINUX_WITHOUT_SEPOLICY_STATE_VERSION) return false;
-    if (kver >= VERSION(4, 17, 0)) return true;
+    /* selinux_state itself landed in 4.19; 4.17 and 4.18 are upstream trees
+     * without it, so the version alone does not imply the stateful ABI. */
+    if (kver >= KP_SELINUX_MAIN_VERSION) return true;
     return selinux_hide_runtime_has_state() != 0;
 }
 
