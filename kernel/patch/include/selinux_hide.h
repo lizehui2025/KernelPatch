@@ -31,6 +31,12 @@ int selinux_hide_legacy_required(void);
  * take a state argument on pre-4.17 kernels. */
 int selinux_hide_runtime_has_state(void);
 
+/* True when a pre-4.19 tree exports selinux_state but nothing can settle the
+ * security_read_policy() ABI: both backends would call the ss/ helpers with the
+ * wrong argument count, so neither is allowed to run.  BTF settles it, and the
+ * manager can force the stateful backend with /data/adb/ap/selinux_hide_main. */
+int selinux_hide_state_abi_unverified(void);
+
 /* Whether the ss/ helpers (avc_has_perm, security_read_policy,
  * context_struct_to_string, security_context_to_sid, ...) take a
  * struct selinux_state argument: 4.17+ always, 6.6+ never, and 4.9 - 4.16

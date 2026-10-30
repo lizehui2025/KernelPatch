@@ -1088,6 +1088,12 @@ int selinux_hide_legacy_init(void)
 
     if (!selinux_hide_legacy_required()) return -EOPNOTSUPP;
 
+    if (selinux_hide_state_abi_unverified()) {
+        logkfw("selinux_hide: legacy: selinux_state ABI unverifiable on this pre-4.19 tree, "
+               "refusing to run the evaluator\n");
+        return -EOPNOTSUPP;
+    }
+
     rc = kp_resolve_eval_symbols();
     if (rc) return rc;
 

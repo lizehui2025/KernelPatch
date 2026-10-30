@@ -518,6 +518,29 @@ int kp_btf_member(int type_id, int idx, const char **name_out, int *type_id_out,
 }
 KP_EXPORT_SYMBOL(kp_btf_member);
 
+// Parameter count of a named function's prototype.  BTF stores the prototype
+// behind a FUNC record (kind 12) whose type field points at FUNC_PROTO, and the
+// parameter count lives in that record's vlen.
+int kp_btf_func_args(const char *name)
+{
+    ensure_btf_loaded();
+    if (!btf_base) return -1;
+    const char *end = btf_types + btf_hdr->type_len;
+    const struct btf_type *t = (const struct btf_type *)btf_types;
+    unsigned long sz;
+    for (int id = 1; (sz = btf_rec_size(t, end)); id++) {
+        if (t->name_off && BTF_INFO_KIND(t->info) == 12 /* func */ &&
+            !lib_strcmp(btf_name(t->name_off), name)) {
+            const struct btf_type *proto = btf_type_by_id(t->type);
+            if (!proto || BTF_INFO_KIND(proto->info) != BTF_KIND_FUNC_PROTO) return -1;
+            return (int)BTF_INFO_VLEN(proto->info);
+        }
+        t = (const struct btf_type *)((const char *)t + sz);
+    }
+    return -1;
+}
+KP_EXPORT_SYMBOL(kp_btf_func_args);
+
 // Skip one typedef/const/volatile/restrict wrapper; returns the underlying id.
 int kp_btf_skip_mod(int type_id)
 {

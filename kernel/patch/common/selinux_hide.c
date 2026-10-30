@@ -70,6 +70,9 @@ extern int android_is_safe_mode;
  * stay live.  Without this file the feature refuses to enable in that state, see
  * selinux_hide_install_hooks(). */
 #define KP_SELINUX_HIDE_PARTIAL_FILE "/data/adb/ap/selinux_hide_partial"
+/* Opt-in for a pre-4.19 tree whose selinux_state ABI nothing can settle, see
+ * selinux_hide_state_abi_unverified(). */
+#define KP_SELINUX_HIDE_MAIN_FILE "/data/adb/ap/selinux_hide_main"
 
 #define KP_O_RDONLY 0
 #define KP_PAGE_SIZE 4096
@@ -679,9 +682,15 @@ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
 
 static ssize_t kp_sel_reply(char *buf, const char *text)
 {
-    size_t limit = kp_transaction_limit() - KP_SEL_RESPONSE_RESERVE;
+    size_t txn = kp_transaction_limit();
+    size_t limit;
     size_t n = lib_strlen(text);
 
+    /* The reserve is subtracted from a page-sized limit, so this cannot wrap
+     * today; refuse instead of trusting that, because a wrapped limit would
+     * copy the whole string into a buffer sized for the original limit. */
+    if (txn <= KP_SEL_RESPONSE_RESERVE) return -ERANGE;
+    limit = txn - KP_SEL_RESPONSE_RESERVE;
     if (n >= limit) n = limit - 1;
     lib_memcpy(buf, text, n);
     buf[n] = 0;
@@ -1426,13 +1435,53 @@ err:
  */
 int selinux_hide_runtime_has_state(void)
 {
-    /* Only cache a positive answer: ksyms may still be empty very early in boot,
-     * so a miss has to stay retryable. */
+    /* 0 = unanswered, 1 = stateful, -1 = BTF proved the plain ABI.  Only a
+     * positive kallsyms answer is cached as retryable, because ksyms may still
+     * be empty very early in boot. */
     static int have_state;
 
-    if (have_state) return 1;
+    if (have_state) return have_state > 0;
+
+    /* A backport that only adds the variable leaves security_read_policy()
+     * with two parameters; calling it with three corrupts the struct.  BTF
+     * answers that question directly, so it outranks the symbol. */
+    switch (kp_btf_func_args("security_read_policy")) {
+    case 3: have_state = 1; return 1;
+    case 2: have_state = -1; return 0;
+    default: break;
+    }
+
     if (kvar(selinux_state) || lookup_name_with_suffix("selinux_state")) have_state = 1;
-    return have_state;
+    return have_state > 0;
+}
+
+/*
+ * A pre-4.19 kernel that exports selinux_state is a vendor backport, and the
+ * symbol says nothing about the ABI: the backport either moved the policydb
+ * into the state (3-argument security_read_policy) or merely kept the plain
+ * layout (2-argument).  Guessing wrong writes a vmalloc pointer into the
+ * struct and takes the boot down, which is what a 4.14 device did with the
+ * control file created by hand.
+ *
+ * True means "cannot tell": neither backend may run.  BTF settles it when the
+ * kernel carries BTF; otherwise the manager opts in by creating
+ * /data/adb/ap/selinux_hide_main after checking its own tree.
+ */
+int selinux_hide_state_abi_unverified(void)
+{
+    struct file *f;
+    bool optin;
+
+    if (kver >= KP_SELINUX_MAIN_VERSION || !selinux_hide_is_supported()) return 0;
+    if (!selinux_hide_runtime_has_state()) return 0;
+    /* -1 here means BTF says 2-arg, which runtime_has_state() already turned
+     * into "no state".  Any non-negative answer settled the question. */
+    if (kp_btf_func_args("security_read_policy") >= 0) return 0;
+
+    f = filp_open(KP_SELINUX_HIDE_MAIN_FILE, KP_O_RDONLY, 0);
+    optin = !IS_ERR(f);
+    if (optin) filp_close(f, 0);
+    return !optin;
 }
 
 /*
@@ -1451,12 +1500,17 @@ int selinux_hide_main_path_supported(void)
 {
     if (kver >= KP_SELINUX_MAIN_VERSION) return 1;
     if (kver < KP_SELINUX_HIDE_MIN_VERSION) return 0;
+    if (selinux_hide_state_abi_unverified()) return 0;
     return selinux_hide_runtime_has_state();
 }
 
 int selinux_hide_legacy_required(void)
 {
-    return kver >= KP_SELINUX_HIDE_MIN_VERSION && !selinux_hide_main_path_supported();
+    if (!selinux_hide_is_supported()) return 0;
+    /* The legacy backend resolves the same ss/ helpers through the same
+     * 2- vs 3-argument rule, so an unverifiable ABI poisons it too. */
+    if (selinux_hide_state_abi_unverified()) return 0;
+    return !selinux_hide_main_path_supported();
 }
 
 int selinux_hide_enable(void)
@@ -1470,6 +1524,14 @@ int selinux_hide_enable(void)
         return -EOPNOTSUPP;
     }
     if (selinux_hide_enabled) return 0;
+
+    if (selinux_hide_state_abi_unverified()) {
+        logkfw("selinux_hide: kernel %x exports selinux_state but no BTF can confirm the "
+               "security_read_policy() ABI; refusing to guess (a 3-arg call into the 2-arg "
+               "layout kills the boot). Create %s to force the stateful backend.\n",
+               kver, KP_SELINUX_HIDE_MAIN_FILE);
+        return -EOPNOTSUPP;
+    }
 
     if (!selinux_sepolicy_backup_ready()) {
         log_boot("selinux_hide: no backup sepolicy available, please save feature and reboot to retry\n");
@@ -1555,6 +1617,8 @@ int selinux_hide_post_fs_data(const char *args)
      * "after", once apd/Magisk have finished their policy reloads. */
     if (lib_strcmp(args, "before") == 0 || args[0] == '\0') {
         log_boot("selinux_hide: post-fs-data before\n");
+        log_boot("selinux_hide: btf security_read_policy args: %d, state ABI unverified: %d\n",
+                 kp_btf_func_args("security_read_policy"), selinux_hide_state_abi_unverified());
         /* Diagnostic: is the boot policy still untouched at this point? */
         selinux_sepolicy_probe_live("pfd-before");
 
@@ -1695,6 +1759,8 @@ void selinux_hide_resolve_symbols(void)
     log_boot("selinux_hide: sel_open_policy: %llx\n", sel_open_policy_addr);
     log_boot("selinux_hide: ss/ ABI: %s state argument, legacy backend: %d\n",
              selinux_hide_ss_takes_state() ? "with" : "without", selinux_hide_legacy_required());
+    log_boot("selinux_hide: security_read_policy BTF args: %d, state ABI unverified: %d\n",
+             kp_btf_func_args("security_read_policy"), selinux_hide_state_abi_unverified());
 }
 
 #ifdef KP_SELINUX_HIDE_SELFTEST

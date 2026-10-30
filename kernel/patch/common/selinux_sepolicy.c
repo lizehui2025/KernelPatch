@@ -844,8 +844,8 @@ static int kp_dup_sepolicy(void)
     struct policy_file fp;
     struct policydb *pdb;
     void *data = NULL;
-    void *pol;
-    void *sidtab;
+    void *pol = NULL;
+    void *sidtab = NULL;
     size_t len = 0;
     bool owned = false;
     bool live_clean = false;
@@ -879,6 +879,28 @@ static int kp_dup_sepolicy(void)
          * whether it is still free of root markers. */
         live_clean = kp_blob_is_clean(data, len);
         log_boot("selinux_sepolicy: live blob scan (len %zu), clean=%d\n", len, live_clean);
+    }
+
+    /* The two blocks below are sized for the layouts this file declares.  BTF
+     * can prove that a newer kernel's structs still fit; without BTF the
+     * generous sizes stay the only guarantee, so the check is skipped rather
+     * than failed. */
+    {
+        long need = kp_btf_type_size("policydb");
+
+        if (need > 0 && (unsigned long)need + KP_POLICY_POLICYDB_OFFSET > KP_BACKUP_POLICY_SIZE) {
+            logkfw("selinux_sepolicy: struct policydb needs %ld bytes, the policy block holds %lu\n",
+                   need, (unsigned long)(KP_BACKUP_POLICY_SIZE - KP_POLICY_POLICYDB_OFFSET));
+            rc = -E2BIG;
+            goto out_free;
+        }
+        need = kp_btf_type_size("sidtab");
+        if (need > 0 && (unsigned long)need > KP_BACKUP_SIDTAB_SIZE) {
+            logkfw("selinux_sepolicy: struct sidtab needs %ld bytes, the sidtab block holds %u\n",
+                   need, (unsigned)KP_BACKUP_SIDTAB_SIZE);
+            rc = -E2BIG;
+            goto out_free;
+        }
     }
 
     /* policydb_read()/policydb_load_isids() require zero-initialized targets
