@@ -1148,8 +1148,9 @@ static void after_sel_open_policy(hook_fargs2_t *a, void *udata)
         return;
     }
     lib_memcpy(copy, blob, len);
-    *(void **)plm = copy;
-    *(size_t *)((char *)plm + sizeof(void *)) = len;
+    /* struct policy_load_memory { size_t len; void *data; } -- len first. */
+    *(size_t *)plm = len;
+    *(void **)((char *)plm + sizeof(size_t)) = copy;
     kp_vfree(old);
     logkfi("selinux_hide: policy open: serving clean blob (%zu bytes, copied)\n", len);
 }
