@@ -541,6 +541,31 @@ static struct {
     u32 depth;
 } clean_eval_slots[KP_CLEAN_EVAL_SLOTS];
 
+/* Non-zero while a task holds a slot.  before_context_struct_compute_av() runs
+ * for every context in the system -- every AVC miss, hidden or not -- so its
+ * idle path has to be one load and a branch, not a walk of the slot array.  The
+ * counter is touched only when a scope is really entered or left, and it sits
+ * on its own cache line so the two hot hooks never share one with the slots a
+ * scope writes. */
+static int kp_clean_eval_users __attribute__((aligned(64)));
+
+static inline bool kp_clean_eval_idle(void)
+{
+    return __atomic_load_n(&kp_clean_eval_users, __ATOMIC_ACQUIRE) == 0;
+}
+
+/* Keep the counter a cmpxchg loop: a 32-bit add would be outlined into
+ * __aarch64_ldadd4_rel, which this freestanding image does not link. */
+static void kp_clean_eval_users_add(int delta)
+{
+    int old, new;
+
+    do {
+        old = __atomic_load_n(&kp_clean_eval_users, __ATOMIC_RELAXED);
+        new = old + delta;
+    } while (cmpxchg(&kp_clean_eval_users, old, new) != old);
+}
+
 static bool kp_clean_eval_enter(void)
 {
     int i;
@@ -554,6 +579,7 @@ static bool kp_clean_eval_enter(void)
     for (i = 0; i < KP_CLEAN_EVAL_SLOTS; i++) {
         if (cmpxchg(&clean_eval_slots[i].task, NULL, current) == NULL) {
             clean_eval_slots[i].depth = 1;
+            kp_clean_eval_users_add(1);
             return true;
         }
     }
@@ -571,6 +597,7 @@ static void kp_clean_eval_leave(void)
         } else {
             clean_eval_slots[i].depth = 0;
             __atomic_store_n(&clean_eval_slots[i].task, NULL, __ATOMIC_RELEASE);
+            kp_clean_eval_users_add(-1);
         }
         return;
     }
@@ -580,6 +607,7 @@ static bool kp_clean_eval_active(void)
 {
     int i;
 
+    if (kp_clean_eval_idle()) return false;
     for (i = 0; i < KP_CLEAN_EVAL_SLOTS; i++) {
         if (__atomic_load_n(&clean_eval_slots[i].task, __ATOMIC_ACQUIRE) == current &&
             clean_eval_slots[i].depth)
@@ -600,12 +628,17 @@ void selinux_sepolicy_clean_eval_leave(void)
 
 static void before_context_struct_compute_av(hook_fargs6_t *a, void *u)
 {
-    if (!kp_clean_eval_active() || !g_backup_ready) return;
-    void *clean = kp_backup_policydb();
-    if (!is_bad_address(clean)) {
-        if (selinux_hide_query_log_level() >= 2)
-            logkfi("query redirect compute_av: policydb %llx -> %llx\n", a->arg0, (unsigned long)clean);
-        a->arg0 = (uint64_t)clean;
+    /* One load for the whole system: this runs on every AVC miss. */
+    if (!g_backup_ready || kp_clean_eval_idle()) return;
+    if (!kp_clean_eval_active()) return;
+    {
+        void *clean = kp_backup_policydb();
+
+        if (!is_bad_address(clean)) {
+            if (selinux_hide_query_log_level() >= 2)
+                logkfi("query redirect compute_av: policydb %llx -> %llx\n", a->arg0, (unsigned long)clean);
+            a->arg0 = (uint64_t)clean;
+        }
     }
 }
 
@@ -613,8 +646,11 @@ static void before_context_struct_compute_av(hook_fargs6_t *a, void *u)
  * redirect so contextExists probes resolve against the clean snapshot. */
 static void before_string_to_context_struct(hook_fargs5_t *a, void *u)
 {
-    if (kp_clean_eval_active() && g_backup_ready) {
+    if (!g_backup_ready || kp_clean_eval_idle()) return;
+    if (!kp_clean_eval_active()) return;
+    {
         void *clean = kp_backup_policydb();
+
         if (!is_bad_address(clean)) {
             if (selinux_hide_query_log_level() >= 2)
                 logkfi("query redirect string_to_context_struct: policydb %llx -> %llx\n", a->arg0,
