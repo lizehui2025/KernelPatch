@@ -349,38 +349,11 @@ static int kp_avc_check(u32 tsid, u16 tclass, u32 requested)
 
 int security_context_to_sid_fn(const char *context, int len, u32 *sid, gfp_t gfp);
 
-/*
- * Resolve an app-supplied context: the clean snapshot decides whether it is
- * known, and the live policy is consulted only for a context the snapshot
- * accepted.
- *
- * The live lookup reproduces a stock query's registration side effect: selinuxfs
- * resolves a context in the live policy, which inserts it into the live SID
- * table.  That is what keeps a SID handed out by the snapshot resolvable
- * through the live policy -- KernelSU a810677b, "fix sidtab detection" -- and
- * the table's size is readable by anyone through
- * /sys/fs/selinux/ss/sidtab_hash_stats, so the registration is observable.
- *
- * It must NOT run for a context the snapshot rejects: the live policy is where
- * a root manager's extra domains live, so resolving a hidden name
- * (u:r:su:s0, u:r:ksu:s0, ...) there would register it while the answer says
- * "unknown".  An app watching that counter would see the live table grow on a
- * rejected query, which no clean device does, and could enumerate the hidden
- * policy with a wordlist.  Confining the lookup to the accepted path also keeps
- * a rejected name exactly as expensive as the snapshot's own failed parse,
- * whether or not the live policy knows it, so the rejected inputs cannot be
- * told apart by cost either.
- *
- * Returns the snapshot's verdict: 0 = the context is answered from the snapshot
- * and *sid is its SID.
- */
-static int kp_context_to_sid_clean(const char *scontext, u32 scontext_len, u32 *sid)
-{
-    /* Snapshot parse + direct live-sidtab registration, with a checked fallback
-     * to the stock string parse inside selinux_sepolicy.  A context the
-     * snapshot rejects never reaches the live policy. */
-    return selinux_sepolicy_context_to_sid_sync(scontext, scontext_len, sid, KP_GFP_KERNEL);
-}
+/* The accepted-query path now lives in selinux_sepolicy.c:
+ * selinux_sepolicy_context_to_canonical() parses the transaction buffer against
+ * the snapshot, registers the context in the live sidtab (stock side effect)
+ * and canonicalizes from the snapshot; selinux_sepolicy_access_av() does the
+ * same for the two /access contexts and computes the AV directly. */
 
 static ssize_t kp_patch_response_seqno(char *buf, ssize_t ret, u32 new_seqno)
 {
@@ -463,7 +436,7 @@ static ssize_t my_write_context_new(struct file *file, char *buf, size_t size)
 
     uid_t uid = current_uid();
     char *canon = NULL;
-    u32 sid, len;
+    u32 len = 0;
     ssize_t length;
 
     /* Before the permission check on purpose: the log is what makes detector
@@ -478,19 +451,14 @@ static ssize_t my_write_context_new(struct file *file, char *buf, size_t size)
         return length;
     }
 
-    /* KernelSU my_write_context: answer entirely from the clean snapshot.
-     * The stock handler is never run for apps, so the live (patched) sidtab
-     * can never leak into the canonical answer -- no symbol-redirect scope,
-     * no silent fallback to the live policy. */
+    /* Stock checks this before parsing the payload; never parse ahead of it. */
     length = kp_avc_check(KP_SECINITSID_SECURITY, KP_SECCLASS_SECURITY, KP_SECURITY__CHECK_CONTEXT);
     if (length) return length;
 
-    length = kp_context_to_sid_clean(buf, size, &sid);
-    if (length) {
-        return length;
-    }
-
-    length = selinux_sepolicy_sid_to_context(sid, &canon, &len);
+    /* Parse the transaction buffer in place against the snapshot, register the
+     * context in the live sidtab (stock side effect) and canonicalize from the
+     * snapshot -- one parse, no payload copy, no second string parse. */
+    length = selinux_sepolicy_context_to_canonical(buf, (u32)size, &canon, &len);
     if (length) return length;
 
     if ((size_t)len > kp_transaction_limit()) {
@@ -555,7 +523,6 @@ static ssize_t my_write_access_new(struct file *file, char *buf, size_t size)
     char *scon = NULL, *tcon = NULL;
     bool scon_vm = false, tcon_vm = false;
     struct av_decision avd;
-    u32 ssid, tsid, sconlen, tconlen;
     u16 tclass = 0;
     ssize_t length;
 
@@ -585,25 +552,12 @@ static ssize_t my_write_access_new(struct file *file, char *buf, size_t size)
     length = -EINVAL;
     if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3) goto out;
 
-    sconlen = lib_strlen(scon);
-    tconlen = lib_strlen(tcon);
-    if (!sconlen || !tconlen) goto out;
-
-    /* Both contexts must be in the snapshot: a context only the live policy has
-     * (the manager's su domain) is not part of the answer a clean device would
-     * give.  Each accepted context is registered in the live policy as well,
-     * exactly like the stock handler's own conversions do; a rejected one is
-     * not, see kp_context_to_sid_clean. */
-    length = kp_context_to_sid_clean(scon, sconlen, &ssid);
+    /* Both contexts must be known to the snapshot; each accepted one is also
+     * registered in the live sidtab (stock side effect), skipped only if the
+     * manager renumbered a symbol.  The AV itself is computed from the clean
+     * contexts, no snapshot SID round-trip. */
+    length = selinux_sepolicy_access_av(scon, tcon, tclass, &avd);
     if (length) goto out;
-
-    length = kp_context_to_sid_clean(tcon, tconlen, &tsid);
-    if (length) goto out;
-
-    lib_memset(&avd, 0, sizeof(avd));
-    avd.auditdeny = 0xffffffff;
-    selinux_sepolicy_compute_av_user(ssid, tsid, tclass, &avd);
-    avd.seqno = KP_AVD_CLEAN_SEQNO;
 
     {
         char out[96];
@@ -688,6 +642,24 @@ static int my_setprocattr_new(const char *name, void *value, size_t size)
                name ? name : "(null)", vbuf, error ? " (denied)" : "");
     }
     if (error) return error;
+
+    /* Fast path (MAF-style): when the clean/live value indices align, enter the
+     * per-task clean-eval scope around the stock handler.  Its
+     * string_to_context_struct call parses against the snapshot (so a manager
+     * context is rejected) and the live sidtab/AVC/bounded-transition checks
+     * run unchanged -- one clean parse, no extra snapshot copy or parse. */
+    if (selinux_sepolicy_live_aligned()) {
+        if (selinux_sepolicy_clean_eval_enter() == 0) {
+            int rc = orig_setprocattr(name, value, size);
+            selinux_sepolicy_clean_eval_leave();
+            return rc;
+        }
+        if (!g_setprocattr_busy_warned) {
+            g_setprocattr_busy_warned = true;
+            logkfw("selinux_hide: setprocattr: clean-eval slots busy, refusing the transition with -EAGAIN\n");
+        }
+        return -EAGAIN;
+    }
 
     if (size && str[0] && str[0] != '\n') {
         if (str[size - 1] == '\n') {

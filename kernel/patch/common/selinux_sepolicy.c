@@ -515,6 +515,9 @@ static bool g_backup_ready;
  * a later live reload makes that shape stale (logged once). */
 static bool g_shadow_built;
 static bool g_shadow_stale;
+/* The setprocattr fast path depends on string_to_context_struct being
+ * redirected inside the clean-eval scope; never take it if the hook failed. */
+static bool g_string_redirect_installed;
 static void *g_backup_policy; /* our own struct selinux_policy-equivalent (heap) */
 static bool g_backup_allow_unknown;
 
@@ -1469,6 +1472,39 @@ static int kp_shadow_sym(void *clean_pdb, void *live_pdb, int sym, const char *l
     return rc;
 }
 
+static const char *kp_val_name(void *pdb, int sym, u32 value);
+static u32 kp_sym_nprim(void *pdb, int sym);
+static bool g_live_values_aligned;
+
+/* Decide once (under policy_mutex) whether every clean symbol value maps to the
+ * same live name.  The fast accepted path uses this instead of per-query
+ * strcmps; if a manager renumbers a symbol, the live sidtab insert is skipped. */
+static bool kp_live_values_scan(void *clean_pdb, void *live_pdb)
+{
+    static const int syms[] = { 2 /*roles*/, 3 /*types*/, 4 /*users*/, 6 /*levels*/, 7 /*cats*/ };
+    int i;
+    u32 v;
+
+    if (!clean_pdb || !live_pdb) return false;
+    for (i = 0; i < (int)(sizeof(syms) / sizeof(syms[0])); i++) {
+        int sym = syms[i];
+        u32 cn = kp_sym_nprim(clean_pdb, sym);
+        u32 ln = kp_sym_nprim(live_pdb, sym);
+
+        if (sym == 3) { /* live may append types; the clean value range must match */
+            if (ln < cn) return false;
+        } else if (cn != ln) {
+            return false;
+        }
+        for (v = 1; v <= cn; v++) {
+            const char *a = kp_val_name(clean_pdb, sym, v);
+            const char *b = kp_val_name(live_pdb, sym, v);
+            if (!a || !b || lib_strcmp(a, b)) return false;
+        }
+    }
+    return true;
+}
+
 static int kp_symtab_shadow(void)
 {
     unsigned long state;
@@ -1513,6 +1549,10 @@ static int kp_symtab_shadow(void)
         if (one && !rc) rc = one;
         one = kp_shadow_sym(clean_pdb, live_pdb, 7, "cats");
         if (one && !rc) rc = one;
+    }
+    if (!rc) {
+        g_live_values_aligned = kp_live_values_scan(clean_pdb, live_pdb);
+        log_boot("selinux_sepolicy: live value alignment=%d\n", g_live_values_aligned);
     }
     unlock((void *)(state + g_pol_layout.state_policy_mutex));
     return rc;
@@ -1677,16 +1717,19 @@ int selinux_sepolicy_context_to_sid(const char *scontext, u32 scontext_len, u32 
 
 /* ---- fast accepted path ----
  *
- * The snapshot parse already produced a struct context.  Stock also registers
- * that context in the live sidtab (which is what makes ss/sidtab_hash_stats
- * grow for a new name).  Instead of re-parsing the string through
- * security_context_to_sid(), insert the same context object directly into the
- * live sidtab, but only after checking that every value in it still maps to the
- * same name in the live policy (a manager that inserts a type/role/user in the
- * middle would renumber it; then we fall back to the string parse).
+ * The snapshot parse already produces a struct context.  Stock also registers
+ * that context in the live sidtab (the ss/sidtab_hash_stats side effect).
+ * Instead of re-parsing the string, insert the same context object into the
+ * live sidtab under RCU; the canonical string and the access vector are derived
+ * directly from the snapshot context.  The accepted path then does no more work
+ * than stock: one parse, one live sidtab insert, one canonical allocation.
+ *
+ * Value alignment for users/roles/types/levels/cats is decided once at shadow
+ * time (g_live_values_aligned).  If the manager renumbered a symbol, the live
+ * insert is skipped (the snapshot answer is unaffected) and the shadow logs it.
  */
-extern int security_context_to_sid_fn(const char *context, int len, u32 *sid, gfp_t gfp);
-
+static void (*kp_rcu_lock_fn)(void);
+static void (*kp_rcu_unlock_fn)(void);
 static bool kp_live_fast_init_done;
 static bool kp_live_fast_ready;
 static unsigned long kp_live_state_addr;
@@ -1707,9 +1750,15 @@ static bool kp_live_fast_init(void)
         return false;
 
     kp_live_state_addr = lookup_name_with_suffix("selinux_state");
+    kp_rcu_lock_fn = (void (*)(void))(uintptr_t)lookup_name_with_suffix("__rcu_read_lock");
+    kp_rcu_unlock_fn = (void (*)(void))(uintptr_t)lookup_name_with_suffix("__rcu_read_unlock");
     kp_live_lock_fn = (kp_mutex_fn)(uintptr_t)lookup_name_with_suffix("mutex_lock");
     kp_live_unlock_fn = (kp_mutex_fn)(uintptr_t)lookup_name_with_suffix("mutex_unlock");
-    if (!kp_live_state_addr || !kp_live_lock_fn || !kp_live_unlock_fn) return false;
+    if (!kp_live_state_addr) return false;
+    if (!kp_rcu_lock_fn || !kp_rcu_unlock_fn) {
+        if (!kp_live_lock_fn || !kp_live_unlock_fn) return false;
+    }
+    kp_live_context_destroy = (void (*)(struct context *))(uintptr_t)lookup_name_with_suffix("context_destroy");
 
     kp_live_fast_ready = true;
     return true;
@@ -1739,108 +1788,115 @@ static u32 kp_sym_nprim(void *pdb, int sym)
                     (long)sym * g_pol_layout.symtab_size + g_pol_layout.symtab_nprim);
 }
 
-static bool kp_name_eq(void *clean, void *live, int sym, u32 value)
-{
-    const char *a = kp_val_name(clean, sym, value);
-    const char *b = kp_val_name(live, sym, value);
-
-    return a && b && !lib_strcmp(a, b);
-}
-
-static bool kp_live_align(void *clean_pdb, void *live_pdb, const struct context *ctx)
-{
-    int l;
-
-    if (!ctx) return false;
-    if (!kp_name_eq(clean_pdb, live_pdb, 4 /*users*/, ctx->user)) return false;
-    if (!kp_name_eq(clean_pdb, live_pdb, 2 /*roles*/, ctx->role)) return false;
-    if (!kp_name_eq(clean_pdb, live_pdb, 3 /*types*/, ctx->type)) return false;
-    for (l = 0; l < 2; l++) {
-        u32 sens = ctx->range.level[l].sens;
-        if (sens && !kp_name_eq(clean_pdb, live_pdb, 6 /*levels*/, sens)) return false;
-    }
-    /* Category bitmap bits are 0-based values.  An equal nprim means the manager
-     * did not renumber the categories; the shadow verify already proved the
-     * live key set/order for the cat table. */
-    if (kp_sym_nprim(clean_pdb, 7) != kp_sym_nprim(live_pdb, 7)) return false;
-    if (kp_sym_nprim(clean_pdb, 6) != kp_sym_nprim(live_pdb, 6)) return false;
-    return true;
-}
-
 static bool kp_fast_logged;
-static bool kp_slow_logged;
 
-static int kp_live_sync(void *clean_pdb, struct context *ctx)
+static int kp_live_sync(struct context *ctx)
 {
     unsigned long state = kp_live_state_addr;
-    void *policy, *live_pdb, *live_sidtab;
+    void *policy, *live_sidtab;
     u32 live_sid = SECSID_NULL;
-    int rc;
+    int rc = -EOPNOTSUPP;
+    int retry;
 
     if (!kp_live_fast_init() || !state) return -EOPNOTSUPP;
+    if (!g_live_values_aligned) return -EOPNOTSUPP;
 
-    /* policy_mutex also excludes a policy reload while the context is copied
-     * into the live sidtab, so no -ESTALE retry is needed here. */
-    kp_live_lock_fn((void *)(state + g_pol_layout.state_policy_mutex));
-    policy = *(void **)(state + g_pol_layout.state_policy);
-    if (!policy || is_bad_address(policy)) { rc = -EINVAL; goto out; }
-    live_pdb = (char *)policy + g_pol_layout.selpolicy_policydb;
-    live_sidtab = *(void **)((char *)policy + g_pol_layout.selpolicy_sidtab);
-    if (!live_sidtab || is_bad_address(live_sidtab)) { rc = -EINVAL; goto out; }
-    if (!kp_live_align(clean_pdb, live_pdb, ctx)) {
-        if (!kp_slow_logged) {
-            kp_slow_logged = true;
-            logkfi("selinux_sepolicy: live value indices diverged, using the string fallback\n");
+    for (retry = 0; retry < 2; retry++) {
+        if (kp_rcu_lock_fn) {
+            kp_rcu_lock_fn();
+            policy = *(void **)(state + g_pol_layout.state_policy);
+            live_sidtab = (policy && !is_bad_address(policy)) ?
+                          *(void **)((char *)policy + g_pol_layout.selpolicy_sidtab) : NULL;
+            if (!live_sidtab || is_bad_address(live_sidtab)) rc = -EINVAL;
+            else rc = kp_sidtab_context_to_sid(live_sidtab, ctx, &live_sid);
+            kp_rcu_unlock_fn();
+        } else {
+            kp_live_lock_fn((void *)(state + g_pol_layout.state_policy_mutex));
+            policy = *(void **)(state + g_pol_layout.state_policy);
+            live_sidtab = (policy && !is_bad_address(policy)) ?
+                          *(void **)((char *)policy + g_pol_layout.selpolicy_sidtab) : NULL;
+            if (!live_sidtab || is_bad_address(live_sidtab)) rc = -EINVAL;
+            else rc = kp_sidtab_context_to_sid(live_sidtab, ctx, &live_sid);
+            kp_live_unlock_fn((void *)(state + g_pol_layout.state_policy_mutex));
         }
-        rc = -EOPNOTSUPP;
-        goto out;
+        if (rc != -ESTALE) break;
     }
-    rc = kp_sidtab_context_to_sid(live_sidtab, ctx, &live_sid);
     if (!rc && !kp_fast_logged) {
         kp_fast_logged = true;
         logkfi("selinux_sepolicy: direct live sidtab insert active (no second string parse)\n");
     }
-out:
-    kp_live_unlock_fn((void *)(state + g_pol_layout.state_policy_mutex));
     return rc;
 }
 
-int selinux_sepolicy_context_to_sid_sync(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp)
+static int kp_parse_clean(char *scontext, struct context *ctx)
 {
-    struct policydb *policydb = kp_backup_policydb();
+    struct policydb *pdb = kp_backup_policydb();
     void *sidtab = kp_backup_sidtab();
-    struct context context;
-    char *scontext2;
-    bool via_vmalloc = false;
-    int rc;
 
-    if (!g_backup_ready) return -ENOSYS;
-    if (!policydb || !sidtab || !scontext_len) return -EINVAL;
-    if (!kp_string_to_context_struct || !kp_sidtab_context_to_sid) return -ENOSYS;
-    if (scontext_len >= KP_CONTEXT_PAYLOAD_LIMIT) return -EINVAL;
+    if (!pdb || !sidtab || !scontext || !kp_string_to_context_struct) return -ENOSYS;
+    lib_memset(ctx, 0, sizeof(*ctx));
+    return kp_string_to_context_struct(pdb, sidtab, scontext, ctx, SECSID_NULL);
+}
 
+static void kp_context_release(struct context *ctx)
+{
     if (!kp_live_context_destroy)
         kp_live_context_destroy = (void (*)(struct context *))(uintptr_t)lookup_name_with_suffix("context_destroy");
+    if (kp_live_context_destroy) kp_live_context_destroy(ctx);
+}
 
-    scontext2 = kp_payload_alloc(scontext_len + 1, gfp, &via_vmalloc);
-    if (!scontext2) return -ENOMEM;
-    lib_memcpy(scontext2, scontext, scontext_len);
-    scontext2[scontext_len] = '\0';
-    lib_memset(&context, 0, sizeof(context));
+int selinux_sepolicy_live_aligned(void)
+{
+    return (g_live_values_aligned && g_string_redirect_installed) ? 1 : 0;
+}
 
-    rc = kp_string_to_context_struct(policydb, sidtab, scontext2, &context, SECSID_NULL);
-    if (!rc)
-        rc = kp_sidtab_context_to_sid(sidtab, &context, out_sid);
+int selinux_sepolicy_context_to_canonical(char *buf, u32 size, char **canon, u32 *len)
+{
+    struct policydb *pdb = kp_backup_policydb();
+    struct context ctx;
+    int rc;
+
+    if (!g_backup_ready || !buf || !size || !canon || !len) return -EINVAL;
+    *canon = NULL;
+    *len = 0;
+    if (!pdb || !kp_context_struct_to_string) return -ENOSYS;
+
+    rc = kp_parse_clean(buf, &ctx);
+    if (!rc) (void)kp_live_sync(&ctx);
+    if (!rc) rc = kp_context_struct_to_string(pdb, &ctx, canon, len);
+    kp_context_release(&ctx);
+    return rc;
+}
+
+int selinux_sepolicy_access_av(char *scon, char *tcon, u16 tclass, struct av_decision *avd)
+{
+    struct policydb *pdb = kp_backup_policydb();
+    struct context sctx, tctx;
+    int rc;
+
+    if (!g_backup_ready || !scon || !tcon || !avd) return -EINVAL;
+    if (!pdb || !kp_context_struct_compute_av) return -ENOSYS;
+
+    avd->allowed = 0;
+    avd->auditallow = 0;
+    avd->auditdeny = 0xffffffff;
+    avd->seqno = KP_AVD_CLEAN_SEQNO;
+    avd->flags = 0;
+
+    rc = kp_parse_clean(scon, &sctx);
+    if (rc) return rc;
+    rc = kp_parse_clean(tcon, &tctx);
     if (!rc) {
-        if (kp_live_sync(policydb, &context)) {
-            /* Divergent live policy or an insertion failure: fall back to the
-             * stock string parse (which registers the context itself). */
-            u32 live_sid = SECSID_NULL;
-            (void)security_context_to_sid_fn(scontext, (int)scontext_len, &live_sid, gfp);
+        (void)kp_live_sync(&sctx);
+        (void)kp_live_sync(&tctx);
+        if (unlikely(!tclass)) {
+            if (g_backup_allow_unknown) avd->allowed = 0xffffffff;
+        } else {
+            kp_context_struct_compute_av(pdb, &sctx, &tctx, tclass, avd, NULL);
         }
     }
-    if (kp_live_context_destroy) kp_live_context_destroy(&context);
-    kp_payload_free(scontext2, via_vmalloc);
+    kp_context_release(&sctx);
+    kp_context_release(&tctx);
     return rc;
 }
 
@@ -1919,10 +1975,17 @@ int selinux_sepolicy_init(void)
             hook_wrap6((void *)addr, before_context_struct_compute_av, NULL, NULL);
             log_boot("selinux_sepolicy: hooked context_struct_compute_av @ %llx\n", addr);
         }
-        addr = lookup_name_with_suffix("string_to_context_struct");
-        if (addr) {
-            hook_wrap5((void *)addr, before_string_to_context_struct, NULL, NULL);
+    }
+    /* Also used by the >= 5.0 setprocattr fast path: the scope is entered only
+     * around the stock handler, so the callback is a no-op elsewhere. */
+    addr = lookup_name_with_suffix("string_to_context_struct");
+    if (addr) {
+        hook_err_t herr = hook_wrap5((void *)addr, before_string_to_context_struct, NULL, NULL);
+        if (herr == HOOK_NO_ERR) {
+            g_string_redirect_installed = true;
             log_boot("selinux_sepolicy: hooked string_to_context_struct @ %llx\n", addr);
+        } else {
+            logkfw("selinux_sepolicy: hook string_to_context_struct failed: %d\n", (int)herr);
         }
     }
 
