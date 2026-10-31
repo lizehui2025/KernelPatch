@@ -623,17 +623,33 @@ static int my_setprocattr_new(const char *name, void *value, size_t size)
     char vbuf[96];
     int error;
 
-    /* KernelSU my_setprocattr: apps may only transition to contexts that the
-     * CLEAN policy knows; a root-manager context is rejected here, before the
-     * stock handler ever consults the patched live policy. */
+    /* Apps only; non-"current" attributes go straight to the stock handler. */
     if (uid < 10000 || lib_strcmp(name, "current")) goto call_orig;
 
-    /* Stock sequence: the self permission check runs before the context is
-     * parsed, and nothing may touch the payload before it.  A denied write has
-     * to cost exactly what it costs on stock whether the payload is a valid
-     * context or a same-length string that is not; parsing first made a valid
-     * context measurably slower than an invalid one (one extra parse ahead of
-     * the same denial), which KernelSU a85dcbcf had to fix. */
+    /* Fast path: the stock handler already performs the SETCURRENT check before
+     * it parses, so run it directly under the clean-eval scope and let its
+     * string_to_context_struct call read the snapshot.  A value the stock
+     * handler will not parse (empty or a leading newline) needs no scope at
+     * all: call it exactly like stock, which keeps the A/B asymmetry of the
+     * detector's attr/current probe on the stock side (A parses, B does not). */
+    if (selinux_sepolicy_live_aligned()) {
+        if (!(size && str[0] && str[0] != '\n'))
+            return orig_setprocattr(name, value, size);
+        if (selinux_sepolicy_clean_eval_enter() == 0) {
+            int rc = orig_setprocattr(name, value, size);
+            selinux_sepolicy_clean_eval_leave();
+            return rc;
+        }
+        if (!g_setprocattr_busy_warned) {
+            g_setprocattr_busy_warned = true;
+            logkfw("selinux_hide: setprocattr: clean-eval slots busy, refusing the transition with -EAGAIN\n");
+        }
+        return -EAGAIN;
+    }
+
+    /* Slow path (misaligned clean/live values): keep the explicit permission
+     * check and parse the payload against the snapshot before the stock
+     * handler, which would otherwise resolve it in the patched live policy. */
     mysid = kp_current_sid();
     error = kp_avc_check(mysid, KP_SECCLASS_PROCESS, KP_PROCESS__SETCURRENT);
 
@@ -646,24 +662,6 @@ static int my_setprocattr_new(const char *name, void *value, size_t size)
                name ? name : "(null)", vbuf, error ? " (denied)" : "");
     }
     if (error) return error;
-
-    /* Fast path (MAF-style): when the clean/live value indices align, enter the
-     * per-task clean-eval scope around the stock handler.  Its
-     * string_to_context_struct call parses against the snapshot (so a manager
-     * context is rejected) and the live sidtab/AVC/bounded-transition checks
-     * run unchanged -- one clean parse, no extra snapshot copy or parse. */
-    if (selinux_sepolicy_live_aligned()) {
-        if (selinux_sepolicy_clean_eval_enter() == 0) {
-            int rc = orig_setprocattr(name, value, size);
-            selinux_sepolicy_clean_eval_leave();
-            return rc;
-        }
-        if (!g_setprocattr_busy_warned) {
-            g_setprocattr_busy_warned = true;
-            logkfw("selinux_hide: setprocattr: clean-eval slots busy, refusing the transition with -EAGAIN\n");
-        }
-        return -EAGAIN;
-    }
 
     if (size && str[0] && str[0] != '\n') {
         if (str[size - 1] == '\n') {
