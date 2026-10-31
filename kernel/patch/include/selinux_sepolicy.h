@@ -37,11 +37,20 @@ void kp_vfree(const void *addr);
 
 void kp_kernel_str_free(void *p);
 
+/* kmalloc/kfree with the vmalloc fallback, for callers outside this file
+ * (selinux_hide.c parses transaction payloads with stock-sized buffers). */
+void *kp_kernel_alloc(size_t size, gfp_t gfp, bool *via_vmalloc);
+void kp_kernel_free(void *p, bool via_vmalloc);
+
 /* Install anything needed once at boot. */
 int selinux_sepolicy_init(void);
 
 /* KernelSU-style deep copy of the current clean policy (post-fs-data before). */
 int selinux_sepolicy_snapshot(void);
+
+/* Re-shape the snapshot's symbol hash tables to the live policy (call at
+ * post-fs-data "after", before the query hooks are installed). */
+int selinux_sepolicy_shadow(void);
 
 bool selinux_sepolicy_backup_ready(void);
 

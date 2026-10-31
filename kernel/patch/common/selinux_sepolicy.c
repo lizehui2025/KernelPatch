@@ -46,6 +46,7 @@
 #include <uapi/asm-generic/errno.h>
 #include <security/selinux/include/security.h>
 #include <security/selinux/include/avc.h>
+#include <kbtf.h>
 #include <selinux_hide.h>
 
 /* ---- constants ---- */
@@ -449,6 +450,16 @@ static void kp_payload_free(void *p, bool via_vmalloc)
     else if (kp_payload_kfree) kp_payload_kfree(p);
 }
 
+void *kp_kernel_alloc(size_t size, gfp_t gfp, bool *via_vmalloc)
+{
+    return kp_payload_alloc(size, gfp, via_vmalloc);
+}
+
+void kp_kernel_free(void *p, bool via_vmalloc)
+{
+    kp_payload_free(p, via_vmalloc);
+}
+
 void kp_kernel_str_free(void *p)
 {
     static bool warned;
@@ -500,6 +511,10 @@ static context_struct_compute_av_fn kp_context_struct_compute_av;
 /* ---- state ---- */
 
 static bool g_backup_ready;
+/* Set once the snapshot's symbol tables have been reshaped to the live policy;
+ * a later live reload makes that shape stale (logged once). */
+static bool g_shadow_built;
+static bool g_shadow_stale;
 static void *g_backup_policy; /* our own struct selinux_policy-equivalent (heap) */
 static bool g_backup_allow_unknown;
 
@@ -779,6 +794,11 @@ static void kp_capture_policy_load(uint64_t ret)
 
     if ((int)ret != 0 || g_clean_locked) return;
 
+    if (g_shadow_built && !g_shadow_stale) {
+        g_shadow_stale = true;
+        logkfw("selinux_sepolicy: live policy reloaded after the shadow, timing hardening is stale\n");
+    }
+
     /* Never read the hooked function's arguments: security_load_policy's ABI
      * differs across versions and LTO can fold it (on 6.12-android16 arg0 is
      * not the blob pointer, and dereferencing it oopsed).  Serialize whatever
@@ -1000,11 +1020,530 @@ out:
     return rc;
 }
 
+/* ---- policy layout / shape diagnostics ----
+ *
+ * The SELinux symbol tables are hash tables whose size is roundup_pow_of_two(nel)
+ * and whose lookup cost is the bucket chain length.  The clean snapshot and the
+ * live policy can have different type counts, so an invalid-context query can
+ * take a different amount of time depending on which policy answered.  This
+ * logs the shape of both so a timing probe can be correlated with it.
+ */
+struct kp_policy_layout {
+    bool ready;
+    long policydb_symtab;
+    long symtab_size;
+    long symtab_table; /* offset of the embedded struct hashtab */
+    long symtab_nprim;
+    long hashtab_htable;
+    long hashtab_size;
+    long hashtab_nel;
+    long node_key;
+    long node_datum;
+    long node_next;
+    long state_policy;
+    long state_policy_mutex;
+    long selpolicy_policydb;
+    long selpolicy_sidtab;
+};
+
+static struct kp_policy_layout g_pol_layout;
+
+static void kp_policy_layout_init(void)
+{
+    long v;
+
+    if (g_pol_layout.ready) return;
+    g_pol_layout.ready = true;
+
+    g_pol_layout.policydb_symtab = -1;
+    g_pol_layout.symtab_size = -1;
+    g_pol_layout.symtab_table = -1;
+    g_pol_layout.symtab_nprim = -1;
+    g_pol_layout.hashtab_htable = -1;
+    g_pol_layout.hashtab_size = -1;
+    g_pol_layout.hashtab_nel = -1;
+    g_pol_layout.node_key = -1;
+    g_pol_layout.node_datum = -1;
+    g_pol_layout.node_next = -1;
+    g_pol_layout.state_policy = -1;
+    g_pol_layout.state_policy_mutex = -1;
+    g_pol_layout.selpolicy_policydb = -1;
+    g_pol_layout.selpolicy_sidtab = -1;
+
+    /* BTF is required: struct selinux_state/selinux_policy/policydb are
+     * __randomize_layout and their leading fields depend on config.  GKI
+     * kernels ship BTF; without it the shadow is simply disabled. */
+    if (!kp_btf_available()) {
+        log_boot("selinux_sepolicy: layout: BTF unavailable, shadow disabled\n");
+        return;
+    }
+
+    /* The embedded struct symtab + policydb.symtab[] layout arrived in 5.8 and
+     * symtab_insert/symtab_search in 5.9; kp_shadow_resolve() requires those
+     * symbols, so older kernels skip the shadow even if the layout probes. */
+    if ((v = kp_btf_member_offset("policydb", "symtab")) >= 0) g_pol_layout.policydb_symtab = v;
+    if ((v = kp_btf_type_size("symtab")) > 0) g_pol_layout.symtab_size = v;
+    if ((v = kp_btf_member_offset("symtab", "table")) >= 0) g_pol_layout.symtab_table = v;
+    if ((v = kp_btf_member_offset("symtab", "nprim")) >= 0) g_pol_layout.symtab_nprim = v;
+    if ((v = kp_btf_member_offset("hashtab", "htable")) >= 0) g_pol_layout.hashtab_htable = v;
+    if ((v = kp_btf_member_offset("hashtab", "size")) >= 0) g_pol_layout.hashtab_size = v;
+    if ((v = kp_btf_member_offset("hashtab", "nel")) >= 0) g_pol_layout.hashtab_nel = v;
+    if ((v = kp_btf_member_offset("hashtab_node", "key")) >= 0) g_pol_layout.node_key = v;
+    if ((v = kp_btf_member_offset("hashtab_node", "datum")) >= 0) g_pol_layout.node_datum = v;
+    if ((v = kp_btf_member_offset("hashtab_node", "next")) >= 0) g_pol_layout.node_next = v;
+    if ((v = kp_btf_member_offset("selinux_state", "policy")) >= 0) g_pol_layout.state_policy = v;
+    if ((v = kp_btf_member_offset("selinux_state", "policy_mutex")) >= 0) g_pol_layout.state_policy_mutex = v;
+    if ((v = kp_btf_member_offset("selinux_policy", "policydb")) >= 0) g_pol_layout.selpolicy_policydb = v;
+    if ((v = kp_btf_member_offset("selinux_policy", "sidtab")) >= 0) g_pol_layout.selpolicy_sidtab = v;
+
+    /* Bounds: the code stores a struct symtab in u64[4] and a struct hashtab
+     * in u64[2], and walks hashtab_node fields.  Reject anything that would
+     * not fit instead of trusting a future layout blindly. */
+    if (g_pol_layout.policydb_symtab < 0 ||
+        g_pol_layout.symtab_size <= 0 || g_pol_layout.symtab_size > 32 ||
+        g_pol_layout.symtab_table < 0 ||
+        g_pol_layout.symtab_nprim < 0 || g_pol_layout.symtab_nprim + 4 > g_pol_layout.symtab_size ||
+        g_pol_layout.hashtab_htable < 0 || g_pol_layout.hashtab_htable + 8 > g_pol_layout.symtab_size ||
+        g_pol_layout.hashtab_size < 0 || g_pol_layout.hashtab_size + 4 > g_pol_layout.symtab_size ||
+        g_pol_layout.hashtab_nel < 0 || g_pol_layout.hashtab_nel + 4 > g_pol_layout.symtab_size ||
+        g_pol_layout.node_key < 0 || g_pol_layout.node_datum < 0 ||
+        g_pol_layout.node_next < 0 || g_pol_layout.node_next + 8 > 64 ||
+        g_pol_layout.state_policy < 0 || g_pol_layout.state_policy_mutex < 0 ||
+        g_pol_layout.selpolicy_policydb < 0) {
+        logkfw("selinux_sepolicy: layout: incomplete/out-of-range BTF, shadow disabled\n");
+        g_pol_layout.policydb_symtab = -1;
+    }
+}
+
+static u32 kp_symhash(const char *key)
+{
+    u32 val = 0;
+    const char *p = key;
+
+    for (; *p; p++)
+        val = ((val << 4) | (val >> 28)) ^ (u8)*p;
+    return val;
+}
+
+#define KP_PROBE_A "u:r:selinux_hide_probe_invalid:s0"
+#define KP_PROBE_B "\n:r:selinux_hide_probe_invalid:s0"
+
+/* sym: 0 commons, 1 classes, 2 roles, 3 types, 4 users, 5 bools, 6 levels, 7 cats */
+static void kp_log_symtab_shape(const char *tag, void *pdb, int sym, const char *label, const char *probe)
+{
+    char *base, *ht;
+    u32 nprim, size, nel, bucket = 0, chain = 0;
+    void **htable;
+
+    if (!pdb || g_pol_layout.policydb_symtab < 0 || g_pol_layout.symtab_table < 0) return;
+
+    base = (char *)pdb + g_pol_layout.policydb_symtab + (long)sym * g_pol_layout.symtab_size;
+    nprim = *(u32 *)(base + g_pol_layout.symtab_nprim);
+    ht = base + g_pol_layout.symtab_table;
+    size = *(u32 *)(ht + g_pol_layout.hashtab_size);
+    nel = *(u32 *)(ht + g_pol_layout.hashtab_nel);
+    htable = *(void ***)(ht + g_pol_layout.hashtab_htable);
+    if (htable && size) {
+        void *node;
+        bucket = kp_symhash(probe) & (size - 1);
+        for (node = htable[bucket]; node; node = *(void **)((char *)node + g_pol_layout.node_next))
+            chain++;
+    }
+    log_boot("selinux_sepolicy: %s %s nprim=%u size=%u nel=%u bucket=%u chain=%u\n",
+             tag, label, nprim, size, nel, bucket, chain);
+}
+
+typedef void (*kp_mutex_fn)(void *);
+
+static void kp_log_live_policy_shapes(void)
+{
+    unsigned long state = lookup_name_with_suffix("selinux_state");
+    kp_mutex_fn lock = (kp_mutex_fn)(uintptr_t)lookup_name_with_suffix("mutex_lock");
+    kp_mutex_fn unlock = (kp_mutex_fn)(uintptr_t)lookup_name_with_suffix("mutex_unlock");
+    void *policy, *pdb = NULL;
+
+    if (!state || g_pol_layout.policydb_symtab < 0) {
+        log_boot("selinux_sepolicy: live shape: layout unavailable\n");
+        return;
+    }
+    if (!lock || !unlock) {
+        log_boot("selinux_sepolicy: live shape: mutex symbols unavailable\n");
+        return;
+    }
+    lock((void *)(state + g_pol_layout.state_policy_mutex));
+    policy = *(void **)(state + g_pol_layout.state_policy);
+    if (policy && !is_bad_address(policy))
+        pdb = (char *)policy + g_pol_layout.selpolicy_policydb;
+    kp_log_symtab_shape("live", pdb, 4, "users", KP_PROBE_B);
+    kp_log_symtab_shape("live", pdb, 2, "roles", KP_PROBE_A);
+    kp_log_symtab_shape("live", pdb, 3, "types", KP_PROBE_A);
+    unlock((void *)(state + g_pol_layout.state_policy_mutex));
+}
+
+static void kp_log_policy_shapes(void)
+{
+    void *clean;
+
+    kp_policy_layout_init();
+    if (g_pol_layout.policydb_symtab < 0) {
+        log_boot("selinux_sepolicy: shape diagnostics skipped (layout unavailable)\n");
+        return;
+    }
+    clean = kp_backup_policydb();
+    kp_log_symtab_shape("clean", clean, 4, "users", KP_PROBE_B);
+    kp_log_symtab_shape("clean", clean, 2, "roles", KP_PROBE_A);
+    kp_log_symtab_shape("clean", clean, 3, "types", KP_PROBE_A);
+    /* The live shape is logged at enable time: at "before" the manager may not
+     * have reloaded the policy yet, so it would just repeat the clean shape. */
+}
+
+/* ---- live-shape shadow symbol tables ----
+ *
+ * The clean snapshot is a separate policydb, so its hash tables have the clean
+ * type/role/user counts while the live manager-patched policy has more entries.
+ * hashtab_search() walks the bucket in ascending strcmp order and breaks on the
+ * first key greater than the probe, so an invalid context costs a different
+ * number of comparisons depending on which policy answered.  That is the A/B
+ * timing channel.
+ *
+ * Rebuild each parsed symtab (types, roles, users) with the LIVE key set, the
+ * LIVE bucket size and therefore the LIVE sorted order.  Keys the clean policy
+ * knows keep their clean datum; keys the live policy added are inserted with a
+ * NULL datum, so string_to_context_struct exits at the same "!datum" check as
+ * a genuinely unknown name, while the comparisons (count and keys) are exactly
+ * those of the live policy for every probe.  policydb_destroy's destroy_f[]
+ * guard `if (datum)` and kfree() it, so a NULL datum is safe at unload.
+ *
+ * The snapshot is private until the hooks are installed, so no RCU
+ * publication is needed; the build runs once at enable (post-fs-data "after"),
+ * after the manager has reloaded the policy and before the query hooks go in.
+ */
+typedef int (*kp_hashtab_init_fn)(void *h, u32 nel_hint);
+typedef int (*kp_symtab_insert_fn)(void *s, char *name, void *datum);
+typedef void *(*kp_symtab_search_fn)(void *s, const char *name);
+typedef void (*kp_hashtab_destroy_fn)(void *h);
+typedef char *(*kp_kstrdup_fn)(const char *s, gfp_t gfp);
+typedef void (*kp_kfree_fn)(const void *p);
+
+static kp_hashtab_init_fn kp_sh_hashtab_init;
+static kp_symtab_insert_fn kp_sh_symtab_insert;
+static kp_symtab_search_fn kp_sh_symtab_search;
+static kp_hashtab_destroy_fn kp_sh_hashtab_destroy;
+static kp_kstrdup_fn kp_sh_kstrdup;
+static kp_kfree_fn kp_sh_kfree;
+static bool kp_shadow_resolved;
+
+static bool kp_shadow_resolve(void)
+{
+    if (kp_shadow_resolved) return true;
+    kp_shadow_resolved = true;
+    kp_sh_hashtab_init = (kp_hashtab_init_fn)(uintptr_t)lookup_name_with_suffix("hashtab_init");
+    kp_sh_symtab_insert = (kp_symtab_insert_fn)(uintptr_t)lookup_name_with_suffix("symtab_insert");
+    kp_sh_symtab_search = (kp_symtab_search_fn)(uintptr_t)lookup_name_with_suffix("symtab_search");
+    kp_sh_hashtab_destroy = (kp_hashtab_destroy_fn)(uintptr_t)lookup_name_with_suffix("hashtab_destroy");
+    kp_sh_kstrdup = (kp_kstrdup_fn)(uintptr_t)lookup_name_with_suffix("kstrdup");
+    kp_sh_kfree = (kp_kfree_fn)(uintptr_t)lookup_name_with_suffix("kfree");
+    if (!kp_sh_hashtab_init || !kp_sh_symtab_insert || !kp_sh_symtab_search ||
+        !kp_sh_hashtab_destroy || !kp_sh_kstrdup || !kp_sh_kfree) {
+        logkfw("selinux_sepolicy: shadow: symbols missing (init=%d insert=%d search=%d destroy=%d strdup=%d free=%d)\n",
+               !!kp_sh_hashtab_init, !!kp_sh_symtab_insert, !!kp_sh_symtab_search,
+               !!kp_sh_hashtab_destroy, !!kp_sh_kstrdup, !!kp_sh_kfree);
+        return false;
+    }
+    return true;
+}
+
+struct kp_symtab_view {
+    u32 size;
+    u32 nel;
+    u32 nprim;
+    void **htable;
+};
+
+static void kp_symtab_view(void *base, struct kp_symtab_view *v)
+{
+    lib_memset(v, 0, sizeof(*v));
+    if (!base) return;
+    v->size = *(u32 *)((char *)base + g_pol_layout.hashtab_size);
+    v->nel = *(u32 *)((char *)base + g_pol_layout.hashtab_nel);
+    v->nprim = *(u32 *)((char *)base + g_pol_layout.symtab_nprim);
+    v->htable = *(void ***)((char *)base + g_pol_layout.hashtab_htable);
+}
+
+static void *kp_clean_find(struct kp_symtab_view *cv, const char *key, char **key_out, void **datum_out)
+{
+    u32 bucket;
+    void *node;
+
+    if (!cv->htable || !cv->size) return NULL;
+    bucket = kp_symhash(key) & (cv->size - 1);
+    for (node = cv->htable[bucket]; node; node = *(void **)((char *)node + g_pol_layout.node_next)) {
+        char *k = *(char **)((char *)node + g_pol_layout.node_key);
+        if (k && !lib_strcmp(k, key)) {
+            if (key_out) *key_out = k;
+            if (datum_out) *datum_out = *(void **)((char *)node + g_pol_layout.node_datum);
+            return node;
+        }
+    }
+    return NULL;
+}
+
+/* Returns 0 on success, negative on failure.  Keys live-added with a NULL
+ * datum are tracked so a failed build can release them. */
+#define KP_SHADOW_MAX_HIDDEN 256
+
+static int kp_shadow_one_symtab(void *clean_base, void *live_base, const char *label)
+{
+    struct kp_symtab_view cv, lv;
+    u64 tmp[4];
+    char *hidden_keys[KP_SHADOW_MAX_HIDDEN];
+    u32 i, tmp_size, tmp_nel, hidden = 0, kept = 0, hidden_cnt = 0;
+    void **tmp_htable;
+    void *node;
+    int rc;
+
+    kp_symtab_view(clean_base, &cv);
+    kp_symtab_view(live_base, &lv);
+    if (!lv.htable || !lv.size) return 0;
+
+    lib_memset(tmp, 0, sizeof(tmp));
+    rc = kp_sh_hashtab_init(tmp, lv.size); /* size is already a power of two */
+    if (rc) return rc;
+    *(u32 *)((char *)tmp + g_pol_layout.symtab_nprim) = cv.nprim;
+
+    for (i = 0; i < lv.size; i++) {
+        for (node = lv.htable[i]; node; node = *(void **)((char *)node + g_pol_layout.node_next)) {
+            char *live_key = *(char **)((char *)node + g_pol_layout.node_key);
+            char *clean_key = NULL;
+            void *clean_datum = NULL;
+            char *key;
+            void *datum;
+
+            if (!live_key) continue;
+            /* Membership with the kernel's own hash; kp_clean_find only fetches
+             * the reusable clean key pointer.  If they disagree, the local
+             * symhash is not the kernel's: abort instead of turning every
+             * clean name into a NULL-datum hidden key. */
+            if (kp_sh_symtab_search(clean_base, live_key)) {
+                if (!kp_clean_find(&cv, live_key, &clean_key, &clean_datum)) {
+                    logkfw("selinux_sepolicy: shadow %s: symhash mismatch on %s\n", label, live_key);
+                    rc = -EINVAL;
+                    goto out;
+                }
+                key = clean_key;
+                datum = clean_datum;
+            } else {
+                if (kp_clean_find(&cv, live_key, &clean_key, &clean_datum)) {
+                    logkfw("selinux_sepolicy: shadow %s: symhash mismatch (find hit, search miss) on %s\n",
+                           label, live_key);
+                    rc = -EINVAL;
+                    goto out;
+                }
+                key = kp_sh_kstrdup(live_key, KP_GFP_KERNEL);
+                if (!key) { rc = -ENOMEM; goto out; }
+                datum = NULL; /* unknown at the parser's !datum check */
+                if (hidden_cnt < KP_SHADOW_MAX_HIDDEN)
+                    hidden_keys[hidden_cnt++] = key;
+                hidden++;
+            }
+            rc = kp_sh_symtab_insert(tmp, key, datum);
+            if (rc == -EEXIST) { rc = 0; continue; }
+            if (rc) goto out;
+        }
+    }
+
+    /* A clean name the live policy no longer has: keep it for correctness.
+     * NULL-datum entries are keys a previous shadow injected, not clean names. */
+    for (i = 0; i < cv.size; i++) {
+        for (node = cv.htable[i]; node; node = *(void **)((char *)node + g_pol_layout.node_next)) {
+            char *clean_key = *(char **)((char *)node + g_pol_layout.node_key);
+            void *clean_datum = *(void **)((char *)node + g_pol_layout.node_datum);
+
+            if (!clean_key || !clean_datum) continue;
+            if (!kp_sh_symtab_search(tmp, clean_key)) {
+                rc = kp_sh_symtab_insert(tmp, clean_key, clean_datum);
+                if (rc == -EEXIST) { rc = 0; continue; }
+                if (rc) goto out;
+                kept++;
+            }
+        }
+    }
+
+    tmp_size = *(u32 *)((char *)tmp + g_pol_layout.hashtab_size);
+    tmp_nel = *(u32 *)((char *)tmp + g_pol_layout.hashtab_nel);
+    tmp_htable = *(void ***)((char *)tmp + g_pol_layout.hashtab_htable);
+    if (!tmp_htable || tmp_size != lv.size) { rc = -EINVAL; goto out; }
+
+    /* Publish into the private snapshot and retire the old clean nodes.  The
+     * old table's keys/datums are now referenced by the new nodes, so only the
+     * nodes and the htable array may be freed (hashtab_destroy does exactly
+     * that). */
+    {
+        u64 old[2];
+        lib_memset(old, 0, sizeof(old));
+        *(void ***)((char *)old + g_pol_layout.hashtab_htable) = cv.htable;
+        *(u32 *)((char *)old + g_pol_layout.hashtab_size) = cv.size;
+        *(u32 *)((char *)old + g_pol_layout.hashtab_nel) = cv.nel;
+        *(void ***)((char *)clean_base + g_pol_layout.hashtab_htable) = tmp_htable;
+        *(u32 *)((char *)clean_base + g_pol_layout.hashtab_size) = tmp_size;
+        *(u32 *)((char *)clean_base + g_pol_layout.hashtab_nel) = tmp_nel;
+        kp_sh_hashtab_destroy(old);
+    }
+    log_boot("selinux_sepolicy: shadow %s: size %u->%u nel %u->%u, hidden=%u kept=%u\n",
+             label, cv.size, tmp_size, cv.nel, tmp_nel, hidden, kept);
+    return 0;
+
+out:
+    if (hidden_cnt && kp_sh_kfree) {
+        for (i = 0; i < hidden_cnt; i++) kp_sh_kfree(hidden_keys[i]);
+    }
+    tmp_htable = *(void ***)((char *)tmp + g_pol_layout.hashtab_htable);
+    if (tmp_htable) kp_sh_hashtab_destroy(tmp);
+    return rc;
+}
+
+static int kp_shadow_verify_one(void *clean_base, void *live_base, const char *label)
+{
+    struct kp_symtab_view cv, lv;
+    u32 i, matched = 0, extras = 0, mism = 0;
+
+    kp_symtab_view(clean_base, &cv);
+    kp_symtab_view(live_base, &lv);
+    if (cv.size != lv.size) {
+        logkfw("selinux_sepolicy: shadow verify %s: size %u vs %u\n", label, cv.size, lv.size);
+        return -EINVAL;
+    }
+    if (!lv.htable) return cv.htable ? -EINVAL : 0;
+    if (!cv.htable) return -EINVAL;
+
+    /* Prove the live-key projection: in every bucket, the shadow's keys that
+     * exist in live must appear in exactly live's order.  Clean-only extras
+     * (a name live removed) are counted, not treated as a mismatch. */
+    for (i = 0; i < lv.size; i++) {
+        void *cn = cv.htable[i];
+        void *ln = lv.htable[i];
+
+        while (ln) {
+            char *lk = *(char **)((char *)ln + g_pol_layout.node_key);
+            char *ck;
+
+            while (cn) {
+                char *k = *(char **)((char *)cn + g_pol_layout.node_key);
+                if (k && !kp_sh_symtab_search(live_base, k)) {
+                    extras++;
+                    cn = *(void **)((char *)cn + g_pol_layout.node_next);
+                    continue;
+                }
+                break;
+            }
+            if (!cn) { mism++; break; }
+            ck = *(char **)((char *)cn + g_pol_layout.node_key);
+            if (!ck || !lk || lib_strcmp(ck, lk)) { mism++; break; }
+            matched++;
+            cn = *(void **)((char *)cn + g_pol_layout.node_next);
+            ln = *(void **)((char *)ln + g_pol_layout.node_next);
+        }
+        while (cn) {
+            char *k = *(char **)((char *)cn + g_pol_layout.node_key);
+            if (k && !kp_sh_symtab_search(live_base, k)) extras++;
+            cn = *(void **)((char *)cn + g_pol_layout.node_next);
+        }
+    }
+    log_boot("selinux_sepolicy: shadow verify %s: size=%u matched=%u extras=%u mismatches=%u\n",
+             label, cv.size, matched, extras, mism);
+    return mism ? -EINVAL : 0;
+}
+
+static int kp_shadow_sym(void *clean_pdb, void *live_pdb, int sym, const char *label)
+{
+    void *cb = (char *)clean_pdb + g_pol_layout.policydb_symtab + (long)sym * g_pol_layout.symtab_size;
+    void *lb = (char *)live_pdb + g_pol_layout.policydb_symtab + (long)sym * g_pol_layout.symtab_size;
+    int rc;
+
+    rc = kp_shadow_one_symtab(cb, lb, label);
+    if (!rc) rc = kp_shadow_verify_one(cb, lb, label);
+    return rc;
+}
+
+static int kp_symtab_shadow(void)
+{
+    unsigned long state;
+    kp_mutex_fn lock, unlock;
+    void *policy, *live_pdb, *clean_pdb;
+    int rc;
+
+    kp_policy_layout_init();
+    if (g_pol_layout.policydb_symtab < 0) return -EOPNOTSUPP;
+    if (!kp_shadow_resolve()) return -EOPNOTSUPP;
+
+    clean_pdb = kp_backup_policydb();
+    if (!clean_pdb || is_bad_address(clean_pdb)) return -EINVAL;
+
+    state = lookup_name_with_suffix("selinux_state");
+    lock = (kp_mutex_fn)(uintptr_t)lookup_name_with_suffix("mutex_lock");
+    unlock = (kp_mutex_fn)(uintptr_t)lookup_name_with_suffix("mutex_unlock");
+    if (!state || !lock || !unlock) return -ENOENT;
+
+    lock((void *)(state + g_pol_layout.state_policy_mutex));
+    policy = *(void **)(state + g_pol_layout.state_policy);
+    live_pdb = (policy && !is_bad_address(policy)) ? (char *)policy + g_pol_layout.selpolicy_policydb : NULL;
+    if (!live_pdb) {
+        unlock((void *)(state + g_pol_layout.state_policy_mutex));
+        return -EINVAL;
+    }
+    /* String literals are passed straight from each call site: kpimg is moved
+     * without applying relocations, so a static array of pointers would keep
+     * its link-time values.  Run every symtab even if one fails: a verify
+     * mismatch on roles must not leave types/users/levels/cats unshadowed. */
+    {
+        int one;
+
+        rc = 0;
+        one = kp_shadow_sym(clean_pdb, live_pdb, 2, "roles");
+        if (one && !rc) rc = one;
+        one = kp_shadow_sym(clean_pdb, live_pdb, 3, "types");
+        if (one && !rc) rc = one;
+        one = kp_shadow_sym(clean_pdb, live_pdb, 4, "users");
+        if (one && !rc) rc = one;
+        one = kp_shadow_sym(clean_pdb, live_pdb, 6, "levels");
+        if (one && !rc) rc = one;
+        one = kp_shadow_sym(clean_pdb, live_pdb, 7, "cats");
+        if (one && !rc) rc = one;
+    }
+    unlock((void *)(state + g_pol_layout.state_policy_mutex));
+    return rc;
+}
+
 int selinux_sepolicy_snapshot(void)
 {
+    int rc;
+
     if (!selinux_sepolicy_supported()) return -EOPNOTSUPP;
     if (g_backup_ready) return 0;
-    return kp_dup_sepolicy();
+    rc = kp_dup_sepolicy();
+    if (!rc) kp_log_policy_shapes();
+    return rc;
+}
+
+int selinux_sepolicy_shadow(void)
+{
+    int rc;
+
+    kp_policy_layout_init();
+    if (g_pol_layout.policydb_symtab < 0) {
+        log_boot("selinux_sepolicy: shadow skipped (layout unavailable)\n");
+        return -EOPNOTSUPP;
+    }
+    /* The snapshot is rebuilt once.  Rebuilding on a later enable would need a
+     * safe publish/grace period (the table is being read by query hooks); a
+     * later live reload is logged as stale instead. */
+    if (g_shadow_built) return 0;
+    kp_log_live_policy_shapes();
+    rc = kp_symtab_shadow();
+    log_boot("selinux_sepolicy: shadow rc=%d\n", rc);
+    kp_log_symtab_shape("shadow", kp_backup_policydb(), 3, "types", KP_PROBE_A);
+    if (!rc) g_shadow_built = true;
+    return rc;
 }
 
 bool selinux_sepolicy_backup_ready(void)
