@@ -634,20 +634,20 @@ static int my_setprocattr_new(const char *name, void *value, size_t size)
      * parses, so a rejected write never reaches the parser and the clean-eval
      * scope would be pure cost.  Run that same check here, once, for every
      * value: a denial then costs exactly one avc_has_perm and no scope, which
-     * is what stock does, and the accepted path (rare for apps) pays the
-     * stock check once more inside the handler.
+     * is what stock does.
      *
-     * The check is deliberately value-independent.  A paired A/B timing probe
-     * (the same length, one byte changed) must not be able to tell the two
-     * payloads apart before the denial: entering the scope for a parsed value
-     * but not for a leading newline is exactly such a tell, and it is visible
-     * at stock clocks. */
+     * Everything past the check is admitted through the scope for every value,
+     * including one the stock handler does not parse (empty or a leading
+     * newline).  The scope is what redirects the parse, but a paired A/B probe
+     * compares two payloads of the same length, so letting only the parsed one
+     * pay the enter/leave would leave a value-dependent cost in the pair at
+     * every clock -- and it would also mean the two payloads are checked
+     * against different policies.  A value the handler never parses pays the
+     * same few cycles and nothing else. */
     if (selinux_sepolicy_live_aligned()) {
         mysid = kp_current_sid();
         error = kp_avc_check_sid(mysid, mysid, KP_SECCLASS_PROCESS, KP_PROCESS__SETCURRENT);
         if (error) return error;
-        if (!(size && str[0] && str[0] != '\n'))
-            return orig_setprocattr(name, value, size);
         if (selinux_sepolicy_clean_eval_enter() == 0) {
             int rc = orig_setprocattr(name, value, size);
             selinux_sepolicy_clean_eval_leave();
