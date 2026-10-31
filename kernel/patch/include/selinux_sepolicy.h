@@ -61,6 +61,11 @@ void selinux_sepolicy_clean_eval_leave(void);
 
 /* Query helpers that answer against the deep copy. */
 int selinux_sepolicy_context_to_sid(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp);
+
+/* Parse against the deep copy and register the result in the live sidtab
+ * directly when every value still maps to the same live name (no second
+ * string parse); falls back to security_context_to_sid() otherwise. */
+int selinux_sepolicy_context_to_sid_sync(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp);
 int selinux_sepolicy_sid_to_context(u32 sid, char **scontext, u32 *scontext_len);
 int selinux_sepolicy_context_str_to_sid(const char *scontext, u32 *out_sid, gfp_t gfp);
 void selinux_sepolicy_compute_av_user(u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);

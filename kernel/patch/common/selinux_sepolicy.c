@@ -1031,6 +1031,7 @@ out:
 struct kp_policy_layout {
     bool ready;
     long policydb_symtab;
+    long policydb_sym_val_to_name;
     long symtab_size;
     long symtab_table; /* offset of the embedded struct hashtab */
     long symtab_nprim;
@@ -1056,6 +1057,7 @@ static void kp_policy_layout_init(void)
     g_pol_layout.ready = true;
 
     g_pol_layout.policydb_symtab = -1;
+    g_pol_layout.policydb_sym_val_to_name = -1;
     g_pol_layout.symtab_size = -1;
     g_pol_layout.symtab_table = -1;
     g_pol_layout.symtab_nprim = -1;
@@ -1082,6 +1084,8 @@ static void kp_policy_layout_init(void)
      * symtab_insert/symtab_search in 5.9; kp_shadow_resolve() requires those
      * symbols, so older kernels skip the shadow even if the layout probes. */
     if ((v = kp_btf_member_offset("policydb", "symtab")) >= 0) g_pol_layout.policydb_symtab = v;
+    if ((v = kp_btf_member_offset("policydb", "sym_val_to_name")) >= 0)
+        g_pol_layout.policydb_sym_val_to_name = v;
     if ((v = kp_btf_type_size("symtab")) > 0) g_pol_layout.symtab_size = v;
     if ((v = kp_btf_member_offset("symtab", "table")) >= 0) g_pol_layout.symtab_table = v;
     if ((v = kp_btf_member_offset("symtab", "nprim")) >= 0) g_pol_layout.symtab_nprim = v;
@@ -1669,6 +1673,175 @@ int selinux_sepolicy_context_to_sid(const char *scontext, u32 scontext_len, u32 
 {
     if (!g_backup_ready) return -ENOSYS;
     return kp_context_to_sid_with_policy(scontext, scontext_len, out_sid, SECSID_NULL, gfp);
+}
+
+/* ---- fast accepted path ----
+ *
+ * The snapshot parse already produced a struct context.  Stock also registers
+ * that context in the live sidtab (which is what makes ss/sidtab_hash_stats
+ * grow for a new name).  Instead of re-parsing the string through
+ * security_context_to_sid(), insert the same context object directly into the
+ * live sidtab, but only after checking that every value in it still maps to the
+ * same name in the live policy (a manager that inserts a type/role/user in the
+ * middle would renumber it; then we fall back to the string parse).
+ */
+extern int security_context_to_sid_fn(const char *context, int len, u32 *sid, gfp_t gfp);
+
+static bool kp_live_fast_init_done;
+static bool kp_live_fast_ready;
+static unsigned long kp_live_state_addr;
+static kp_mutex_fn kp_live_lock_fn;
+static kp_mutex_fn kp_live_unlock_fn;
+static void (*kp_live_context_destroy)(struct context *);
+
+static bool kp_live_fast_init(void)
+{
+    if (kp_live_fast_init_done) return kp_live_fast_ready;
+    kp_live_fast_init_done = true;
+
+    kp_policy_layout_init();
+    if (kver < VERSION(6, 6, 0)) return false;
+    if (g_pol_layout.policydb_sym_val_to_name < 0 ||
+        g_pol_layout.selpolicy_sidtab < 0 ||
+        !kp_sidtab_context_to_sid || !kp_string_to_context_struct)
+        return false;
+
+    kp_live_state_addr = lookup_name_with_suffix("selinux_state");
+    kp_live_lock_fn = (kp_mutex_fn)(uintptr_t)lookup_name_with_suffix("mutex_lock");
+    kp_live_unlock_fn = (kp_mutex_fn)(uintptr_t)lookup_name_with_suffix("mutex_unlock");
+    if (!kp_live_state_addr || !kp_live_lock_fn || !kp_live_unlock_fn) return false;
+
+    kp_live_fast_ready = true;
+    return true;
+}
+
+static const char *kp_val_name(void *pdb, int sym, u32 value)
+{
+    char ***base;
+    char **arr;
+    const char *name;
+
+    if (!pdb || sym < 0 || sym >= 8 || !value ||
+        g_pol_layout.policydb_sym_val_to_name < 0) return NULL;
+    base = (char ***)((char *)pdb + g_pol_layout.policydb_sym_val_to_name);
+    if (is_bad_address(base)) return NULL;
+    arr = base[sym];
+    if (!arr || is_bad_address(arr)) return NULL;
+    name = arr[value - 1];
+    if (!name || is_bad_address((void *)(uintptr_t)name)) return NULL;
+    return name;
+}
+
+static u32 kp_sym_nprim(void *pdb, int sym)
+{
+    if (!pdb || g_pol_layout.policydb_symtab < 0) return 0;
+    return *(u32 *)((char *)pdb + g_pol_layout.policydb_symtab +
+                    (long)sym * g_pol_layout.symtab_size + g_pol_layout.symtab_nprim);
+}
+
+static bool kp_name_eq(void *clean, void *live, int sym, u32 value)
+{
+    const char *a = kp_val_name(clean, sym, value);
+    const char *b = kp_val_name(live, sym, value);
+
+    return a && b && !lib_strcmp(a, b);
+}
+
+static bool kp_live_align(void *clean_pdb, void *live_pdb, const struct context *ctx)
+{
+    int l;
+
+    if (!ctx) return false;
+    if (!kp_name_eq(clean_pdb, live_pdb, 4 /*users*/, ctx->user)) return false;
+    if (!kp_name_eq(clean_pdb, live_pdb, 2 /*roles*/, ctx->role)) return false;
+    if (!kp_name_eq(clean_pdb, live_pdb, 3 /*types*/, ctx->type)) return false;
+    for (l = 0; l < 2; l++) {
+        u32 sens = ctx->range.level[l].sens;
+        if (sens && !kp_name_eq(clean_pdb, live_pdb, 6 /*levels*/, sens)) return false;
+    }
+    /* Category bitmap bits are 0-based values.  An equal nprim means the manager
+     * did not renumber the categories; the shadow verify already proved the
+     * live key set/order for the cat table. */
+    if (kp_sym_nprim(clean_pdb, 7) != kp_sym_nprim(live_pdb, 7)) return false;
+    if (kp_sym_nprim(clean_pdb, 6) != kp_sym_nprim(live_pdb, 6)) return false;
+    return true;
+}
+
+static bool kp_fast_logged;
+static bool kp_slow_logged;
+
+static int kp_live_sync(void *clean_pdb, struct context *ctx)
+{
+    unsigned long state = kp_live_state_addr;
+    void *policy, *live_pdb, *live_sidtab;
+    u32 live_sid = SECSID_NULL;
+    int rc;
+
+    if (!kp_live_fast_init() || !state) return -EOPNOTSUPP;
+
+    /* policy_mutex also excludes a policy reload while the context is copied
+     * into the live sidtab, so no -ESTALE retry is needed here. */
+    kp_live_lock_fn((void *)(state + g_pol_layout.state_policy_mutex));
+    policy = *(void **)(state + g_pol_layout.state_policy);
+    if (!policy || is_bad_address(policy)) { rc = -EINVAL; goto out; }
+    live_pdb = (char *)policy + g_pol_layout.selpolicy_policydb;
+    live_sidtab = *(void **)((char *)policy + g_pol_layout.selpolicy_sidtab);
+    if (!live_sidtab || is_bad_address(live_sidtab)) { rc = -EINVAL; goto out; }
+    if (!kp_live_align(clean_pdb, live_pdb, ctx)) {
+        if (!kp_slow_logged) {
+            kp_slow_logged = true;
+            logkfi("selinux_sepolicy: live value indices diverged, using the string fallback\n");
+        }
+        rc = -EOPNOTSUPP;
+        goto out;
+    }
+    rc = kp_sidtab_context_to_sid(live_sidtab, ctx, &live_sid);
+    if (!rc && !kp_fast_logged) {
+        kp_fast_logged = true;
+        logkfi("selinux_sepolicy: direct live sidtab insert active (no second string parse)\n");
+    }
+out:
+    kp_live_unlock_fn((void *)(state + g_pol_layout.state_policy_mutex));
+    return rc;
+}
+
+int selinux_sepolicy_context_to_sid_sync(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp)
+{
+    struct policydb *policydb = kp_backup_policydb();
+    void *sidtab = kp_backup_sidtab();
+    struct context context;
+    char *scontext2;
+    bool via_vmalloc = false;
+    int rc;
+
+    if (!g_backup_ready) return -ENOSYS;
+    if (!policydb || !sidtab || !scontext_len) return -EINVAL;
+    if (!kp_string_to_context_struct || !kp_sidtab_context_to_sid) return -ENOSYS;
+    if (scontext_len >= KP_CONTEXT_PAYLOAD_LIMIT) return -EINVAL;
+
+    if (!kp_live_context_destroy)
+        kp_live_context_destroy = (void (*)(struct context *))(uintptr_t)lookup_name_with_suffix("context_destroy");
+
+    scontext2 = kp_payload_alloc(scontext_len + 1, gfp, &via_vmalloc);
+    if (!scontext2) return -ENOMEM;
+    lib_memcpy(scontext2, scontext, scontext_len);
+    scontext2[scontext_len] = '\0';
+    lib_memset(&context, 0, sizeof(context));
+
+    rc = kp_string_to_context_struct(policydb, sidtab, scontext2, &context, SECSID_NULL);
+    if (!rc)
+        rc = kp_sidtab_context_to_sid(sidtab, &context, out_sid);
+    if (!rc) {
+        if (kp_live_sync(policydb, &context)) {
+            /* Divergent live policy or an insertion failure: fall back to the
+             * stock string parse (which registers the context itself). */
+            u32 live_sid = SECSID_NULL;
+            (void)security_context_to_sid_fn(scontext, (int)scontext_len, &live_sid, gfp);
+        }
+    }
+    if (kp_live_context_destroy) kp_live_context_destroy(&context);
+    kp_payload_free(scontext2, via_vmalloc);
+    return rc;
 }
 
 int selinux_sepolicy_sid_to_context(u32 sid, char **scontext, u32 *scontext_len)

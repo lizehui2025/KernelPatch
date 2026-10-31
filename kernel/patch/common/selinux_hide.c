@@ -376,27 +376,10 @@ int security_context_to_sid_fn(const char *context, int len, u32 *sid, gfp_t gfp
  */
 static int kp_context_to_sid_clean(const char *scontext, u32 scontext_len, u32 *sid)
 {
-    u32 live_sid = SECSID_NULL;
-    int rc, live_rc;
-
-    *sid = SECSID_NULL;
-
-    /* The snapshot is authoritative.  A context it rejects never reaches the
-     * live policy, so a hidden domain (u:r:su:s0, ...) cannot be resolved or
-     * registered there. */
-    rc = selinux_sepolicy_context_to_sid(scontext, scontext_len, sid, KP_GFP_KERNEL);
-    if (rc) return rc;
-
-    /* KernelSU-style reconciliation: for an accepted context, mirror the
-     * registration side effect a stock query has on the live SID table
-     * (KernelSU's security_context_to_sid_with_policy syncs orig_sidtab for the
-     * same reason).  The live result is never the answer -- if the live policy
-     * rejects the context, the snapshot answer still stands. */
-    live_rc = security_context_to_sid_fn(scontext, scontext_len, &live_sid, KP_GFP_KERNEL);
-    if (live_rc && selinux_hide_query_log_level() >= KP_QLOG_VERBOSE)
-        logkfw("selinux_hide: live resolve failed rc=%d; snapshot answer kept\n", live_rc);
-
-    return 0;
+    /* Snapshot parse + direct live-sidtab registration, with a checked fallback
+     * to the stock string parse inside selinux_sepolicy.  A context the
+     * snapshot rejects never reaches the live policy. */
+    return selinux_sepolicy_context_to_sid_sync(scontext, scontext_len, sid, KP_GFP_KERNEL);
 }
 
 static ssize_t kp_patch_response_seqno(char *buf, ssize_t ret, u32 new_seqno)
