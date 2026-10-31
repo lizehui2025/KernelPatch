@@ -337,9 +337,8 @@ static u32 kp_current_sid(void)
 
 /* avc_has_perm(current_sid, tsid, tclass, requested).  0 = granted (or the
  * check is unavailable, which matches stock behaviour for untrusted_app). */
-static int kp_avc_check(u32 tsid, u16 tclass, u32 requested)
+static int kp_avc_check_sid(u32 mysid, u32 tsid, u16 tclass, u32 requested)
 {
-    u32 mysid = kp_current_sid();
     if (!mysid) return 0;
     if (selinux_hide_is_without_sepolicy_state_version()) {
         if (!kfunc(avc_has_perm)) return 0;
@@ -349,6 +348,11 @@ static int kp_avc_check(u32 tsid, u16 tclass, u32 requested)
         kp_avc_has_perm_compat = (avc_has_perm_compat_fn)lookup_name_with_suffix("avc_has_perm");
     if (!kp_avc_has_perm_compat || !kp_selinux_state_addr) return 0;
     return kp_avc_has_perm_compat((void *)kp_selinux_state_addr, mysid, tsid, tclass, requested, NULL);
+}
+
+static int kp_avc_check(u32 tsid, u16 tclass, u32 requested)
+{
+    return kp_avc_check_sid(kp_current_sid(), tsid, tclass, requested);
 }
 
 int security_context_to_sid_fn(const char *context, int len, u32 *sid, gfp_t gfp);
@@ -626,13 +630,22 @@ static int my_setprocattr_new(const char *name, void *value, size_t size)
     /* Apps only; non-"current" attributes go straight to the stock handler. */
     if (uid < 10000 || lib_strcmp(name, "current")) goto call_orig;
 
-    /* Fast path: the stock handler already performs the SETCURRENT check before
-     * it parses, so run it directly under the clean-eval scope and let its
-     * string_to_context_struct call read the snapshot.  A value the stock
-     * handler will not parse (empty or a leading newline) needs no scope at
-     * all: call it exactly like stock, which keeps the A/B asymmetry of the
-     * detector's attr/current probe on the stock side (A parses, B does not). */
+    /* Fast path.  The stock handler performs the SETCURRENT check *before* it
+     * parses, so a rejected write never reaches the parser and the clean-eval
+     * scope would be pure cost.  Run that same check here, once, for every
+     * value: a denial then costs exactly one avc_has_perm and no scope, which
+     * is what stock does, and the accepted path (rare for apps) pays the
+     * stock check once more inside the handler.
+     *
+     * The check is deliberately value-independent.  A paired A/B timing probe
+     * (the same length, one byte changed) must not be able to tell the two
+     * payloads apart before the denial: entering the scope for a parsed value
+     * but not for a leading newline is exactly such a tell, and it is visible
+     * at stock clocks. */
     if (selinux_sepolicy_live_aligned()) {
+        mysid = kp_current_sid();
+        error = kp_avc_check_sid(mysid, mysid, KP_SECCLASS_PROCESS, KP_PROCESS__SETCURRENT);
+        if (error) return error;
         if (!(size && str[0] && str[0] != '\n'))
             return orig_setprocattr(name, value, size);
         if (selinux_sepolicy_clean_eval_enter() == 0) {
