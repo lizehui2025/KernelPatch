@@ -54,6 +54,7 @@ extern int android_is_safe_mode;
 
 #define KP_SELINUX_HIDE_FILE "/data/adb/ap/selinux_hide"
 #define KP_SELINUX_HIDE_STRICT_FILE "/data/adb/ap/selinux_hide_strict"
+#define KP_SELINUX_HIDE_PREFETCH_FILE "/data/adb/ap/selinux_hide_prefetch"
 
 #define KP_O_RDONLY 0
 #define KP_PAGE_SIZE 4096
@@ -118,6 +119,7 @@ static sel_mmap_status_fn orig_sel_mmap_handle_status;
 
 static unsigned char fake_status_bytes[KP_SELINUX_STATUS_SIZE];
 static void *fake_status_vaddr; /* vmalloc'd page mapped for uid >= 10000 */
+static void *fake_status_page;  /* struct page * of fake_status_vaddr, cached */
 
 static unsigned long g_hooked[8];
 static int g_hooked_cnt;
@@ -236,6 +238,8 @@ static void init_fake_status(void)
         logkfi("selinux_hide: fake status page ready (%lu bytes)\n", size);
     }
     lib_memcpy(fake_status_vaddr, fake_status_bytes, sizeof(fake_status_bytes));
+    if (!fake_status_page && kp_vmalloc_to_page)
+        fake_status_page = kp_vmalloc_to_page(fake_status_vaddr);
 }
 
 #define KP_VMA_VM_START_OFF 0
@@ -741,12 +745,17 @@ static void before_selinux_kernel_status_page(hook_fargs1_t *a, void *u)
     void *page;
 
     if (!selinux_hide_enabled || current_uid() < 10000) return;
-    if (!fake_status_vaddr || !kp_vmalloc_to_page) return;
+    if (!fake_status_vaddr) return;
+
+    /* The struct page * is constant once the vmalloc page exists; caching it
+     * removes one vmalloc_to_page call per status open. */
+    if (!fake_status_page && kp_vmalloc_to_page)
+        fake_status_page = kp_vmalloc_to_page(fake_status_vaddr);
+    if (!fake_status_page) return;
 
     refresh_fake_status();
 
-    page = kp_vmalloc_to_page(fake_status_vaddr);
-    if (!page) return;
+    page = fake_status_page;
 
     a->ret = (uint64_t)page;
     a->skip_origin = 1;
@@ -1328,6 +1337,26 @@ int selinux_hide_post_fs_data(const char *args)
         if (!IS_ERR(filp)) {
             filp_close(filp, 0);
             log_boot("selinux_hide: %s exists\n", KP_SELINUX_HIDE_FILE);
+
+            /* Optional tuning: a digit 0-3 in the prefetch file selects the
+             * shadow-table query prefetch level (0 off, the default). */
+            {
+                struct file *pf = filp_open(KP_SELINUX_HIDE_PREFETCH_FILE, KP_O_RDONLY, 0);
+
+                if (!IS_ERR(pf)) {
+                    char c[8] = { 0 };
+                    loff_t pos = 0;
+                    ssize_t n = kernel_read(pf, c, sizeof(c) - 1, &pos);
+                    int lvl;
+
+                    filp_close(pf, 0);
+                    lvl = (n > 0) ? (c[0] - '0') : 0;
+                    if (lvl >= 0 && lvl <= 3) {
+                        selinux_sepolicy_set_prefetch(lvl);
+                        log_boot("selinux_hide: prefetch level %d\n", lvl);
+                    }
+                }
+            }
 
             /* Resolve ss/ symbols FIRST: the snapshot below needs the resolved
              * kp_policydb_read/kp_policydb_load_isids. */

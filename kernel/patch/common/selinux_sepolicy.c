@@ -1505,6 +1505,83 @@ static bool kp_live_values_scan(void *clean_pdb, void *live_pdb)
     return true;
 }
 
+/* ---- hot-path prefetch ----
+ *
+ * The shadow tables match live in shape, but they are cold: live's tables are
+ * kept warm by the kernel's own SELinux checks.  A (valid user/role, invalid
+ * type) walks into the type/role buckets; B (invalid user) exits early, so a
+ * cold A costs more cycles and the A-B difference grows on a slow or
+ * low-clock CPU.  Prefetch the buckets for both inputs (same cost) before
+ * parsing; only A consumes the warm lines.
+ *
+ * Level: 0 off, 1 type only, 2 role+type, 3 user+role+type.
+ */
+struct kp_shadow_hot {
+    bool ready;
+    void *pdb;
+    void **htable[8];
+    u32 size[8];
+};
+
+static struct kp_shadow_hot g_hot;
+static volatile int g_prefetch_level;
+
+static u32 kp_symhash_n(const char *key, u32 len)
+{
+    u32 val = 0;
+    u32 i;
+
+    for (i = 0; i < len; i++)
+        val = ((val << 4) | (val >> 28)) ^ (u8)key[i];
+    return val;
+}
+
+static void kp_prefetch_token(int sym, const char *s, u32 len)
+{
+    u32 bucket;
+    void *node;
+
+    if (!g_hot.ready || !g_hot.htable[sym] || !g_hot.size[sym] || !len) return;
+    bucket = kp_symhash_n(s, len) & (g_hot.size[sym] - 1);
+    __builtin_prefetch(&g_hot.htable[sym][bucket], 0, 3);
+    node = g_hot.htable[sym][bucket];
+    if (node) __builtin_prefetch(node, 0, 3);
+}
+
+static void kp_prefetch_context(const char *s)
+{
+    const char *p = s;
+    int field;
+
+    if (!g_hot.ready || !s || g_prefetch_level <= 0) return;
+    if (g_hot.pdb) {
+        __builtin_prefetch(g_hot.pdb, 0, 3);
+        __builtin_prefetch((char *)g_hot.pdb + g_pol_layout.policydb_symtab, 0, 3);
+    }
+    for (field = 0; field < 3 && p && *p; field++) {
+        const char *start = p;
+        u32 len;
+
+        while (*p && *p != ':') p++;
+        len = (u32)(p - start);
+        if (field == 0) {
+            if (g_prefetch_level >= 3) kp_prefetch_token(4, start, len);
+        } else if (field == 1) {
+            if (g_prefetch_level >= 2) kp_prefetch_token(2, start, len);
+        } else {
+            kp_prefetch_token(3, start, len);
+        }
+        if (*p == ':') p++;
+    }
+}
+
+void selinux_sepolicy_set_prefetch(int level)
+{
+    if (level < 0) level = 0;
+    if (level > 3) level = 3;
+    g_prefetch_level = level;
+}
+
 static int kp_symtab_shadow(void)
 {
     unsigned long state;
@@ -1551,8 +1628,22 @@ static int kp_symtab_shadow(void)
         if (one && !rc) rc = one;
     }
     if (!rc) {
+        static const int hot_syms[] = { 2, 3, 4, 6, 7 };
+        int hi;
+
         g_live_values_aligned = kp_live_values_scan(clean_pdb, live_pdb);
         log_boot("selinux_sepolicy: live value alignment=%d\n", g_live_values_aligned);
+        g_hot.pdb = clean_pdb;
+        for (hi = 0; hi < (int)(sizeof(hot_syms) / sizeof(hot_syms[0])); hi++) {
+            int sym = hot_syms[hi];
+            struct kp_symtab_view v;
+
+            kp_symtab_view((char *)clean_pdb + g_pol_layout.policydb_symtab +
+                           (long)sym * g_pol_layout.symtab_size, &v);
+            g_hot.htable[sym] = v.htable;
+            g_hot.size[sym] = v.size;
+        }
+        g_hot.ready = true;
     }
     unlock((void *)(state + g_pol_layout.state_policy_mutex));
     return rc;
@@ -1861,10 +1952,17 @@ int selinux_sepolicy_context_to_canonical(char *buf, u32 size, char **canon, u32
     *len = 0;
     if (!pdb || !kp_context_struct_to_string) return -ENOSYS;
 
+    if (g_prefetch_level > 0) kp_prefetch_context(buf);
+
     rc = kp_parse_clean(buf, &ctx);
-    if (!rc) (void)kp_live_sync(&ctx);
-    if (!rc) rc = kp_context_struct_to_string(pdb, &ctx, canon, len);
-    kp_context_release(&ctx);
+    if (!rc) {
+        (void)kp_live_sync(&ctx);
+        rc = kp_context_struct_to_string(pdb, &ctx, canon, len);
+        /* The parser destroys the context on failure, so only release after a
+         * successful parse (avoids a redundant context_destroy on the A/B
+         * failure path). */
+        kp_context_release(&ctx);
+    }
     return rc;
 }
 
@@ -1883,21 +1981,28 @@ int selinux_sepolicy_access_av(char *scon, char *tcon, u16 tclass, struct av_dec
     avd->seqno = KP_AVD_CLEAN_SEQNO;
     avd->flags = 0;
 
+    if (g_prefetch_level > 0) {
+        kp_prefetch_context(scon);
+        kp_prefetch_context(tcon);
+    }
+
     rc = kp_parse_clean(scon, &sctx);
     if (rc) return rc;
     rc = kp_parse_clean(tcon, &tctx);
-    if (!rc) {
-        (void)kp_live_sync(&sctx);
-        (void)kp_live_sync(&tctx);
-        if (unlikely(!tclass)) {
-            if (g_backup_allow_unknown) avd->allowed = 0xffffffff;
-        } else {
-            kp_context_struct_compute_av(pdb, &sctx, &tctx, tclass, avd, NULL);
-        }
+    if (rc) {
+        kp_context_release(&sctx);
+        return rc;
+    }
+    (void)kp_live_sync(&sctx);
+    (void)kp_live_sync(&tctx);
+    if (unlikely(!tclass)) {
+        if (g_backup_allow_unknown) avd->allowed = 0xffffffff;
+    } else {
+        kp_context_struct_compute_av(pdb, &sctx, &tctx, tclass, avd, NULL);
     }
     kp_context_release(&sctx);
     kp_context_release(&tctx);
-    return rc;
+    return 0;
 }
 
 int selinux_sepolicy_sid_to_context(u32 sid, char **scontext, u32 *scontext_len)

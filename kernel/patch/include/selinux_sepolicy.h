@@ -69,6 +69,9 @@ int selinux_sepolicy_context_to_canonical(char *buf, u32 size, char **canon, u32
 int selinux_sepolicy_access_av(char *scon, char *tcon, u16 tclass, struct av_decision *avd);
 /* 1 when every clean symbol value maps to the same live name (set at enable). */
 int selinux_sepolicy_live_aligned(void);
+/* Shadow-table query prefetch level: 0 off, 1 type, 2 role+type,
+ * 3 user+role+type.  Default 0; set from the optional boot file. */
+void selinux_sepolicy_set_prefetch(int level);
 int selinux_sepolicy_sid_to_context(u32 sid, char **scontext, u32 *scontext_len);
 int selinux_sepolicy_context_str_to_sid(const char *scontext, u32 *out_sid, gfp_t gfp);
 void selinux_sepolicy_compute_av_user(u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);
